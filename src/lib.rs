@@ -212,7 +212,7 @@ pub use client::{Client, ProgressCallback, ProgressEvent};
 pub use config::{Config, Protocol};
 pub use error::{Error, Result};
 pub use interval_reporter::{IntervalMessage, IntervalReport, IntervalReporter};
-pub use measurements::Measurements;
+pub use measurements::{Measurements, OneWaySendStats, OneWayRecvStats, ServerOneWayStats};
 pub use protocol::{stream_id_for_index, DEFAULT_STREAM_ID};
 pub use server::Server;
 pub use token_bucket::TokenBucket;

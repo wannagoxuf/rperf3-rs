@@ -1,7 +1,7 @@
 use crate::buffer_pool::BufferPool;
-use crate::config::Config;
+use crate::config::{Config, OneWayMode};
 use crate::interval_reporter::{run_reporter_task, IntervalReport, IntervalReporter};
-use crate::measurements::{get_tcp_stats, IntervalStats, MeasurementsCollector};
+use crate::measurements::{get_tcp_stats, IntervalStats, MeasurementsCollector, ServerOneWayStats};
 use crate::protocol::{deserialize_message, serialize_message, Message, DEFAULT_STREAM_ID};
 use crate::{Error, Result};
 use log::{debug, error, info};
@@ -638,7 +638,7 @@ async fn handle_tcp_client(
     // Read setup message
     let setup_msg = deserialize_message(&mut stream).await?;
 
-    let (protocol, duration, reverse, _parallel, bandwidth, buffer_size) = match setup_msg {
+    let (protocol, duration, reverse, _parallel, bandwidth, buffer_size, one_way, expected_pps) = match setup_msg {
         Message::Setup {
             version: _,
             protocol,
@@ -647,11 +647,12 @@ async fn handle_tcp_client(
             parallel,
             bandwidth,
             buffer_size,
-            ..
+            one_way,
+            expected_pps,
         } => {
             info!(
-                "Client {} setup: protocol={}, duration={}s, reverse={}, parallel={}",
-                addr, protocol, duration, reverse, parallel
+                "Client {} setup: protocol={}, duration={}s, reverse={}, parallel={}, one_way={:?}",
+                addr, protocol, duration, reverse, parallel, one_way
             );
             (
                 protocol,
@@ -660,6 +661,8 @@ async fn handle_tcp_client(
                 parallel,
                 bandwidth,
                 buffer_size,
+                one_way,
+                expected_pps,
             )
         }
         _ => {
@@ -675,6 +678,12 @@ async fn handle_tcp_client(
         udp_config.reverse = reverse;
         udp_config.bandwidth = bandwidth;
         udp_config.buffer_size = buffer_size;
+        udp_config.one_way = match one_way.as_deref() {
+            Some("send") => OneWayMode::Send,
+            Some("receive") => OneWayMode::Receive,
+            _ => OneWayMode::None,
+        };
+        udp_config.expected_pps = expected_pps;
 
         // Handle UDP test via control channel
         return handle_udp_test(stream, addr, udp_config, measurements, udp_buffer_pool).await;
@@ -785,7 +794,35 @@ async fn handle_udp_test(
 
     measurements.set_start_time(Instant::now());
 
-    if reverse {
+    if config.one_way == OneWayMode::Send {
+        // One-way send mode: client sends, server receives only
+        // Bind to UDP port and wait for client packets
+        let bind_addr = format!("0.0.0.0:{}", config.port);
+        let socket = UdpSocket::bind(&bind_addr).await?;
+        configure_udp_socket(&socket)?;
+
+        let stats = recv_one_way_server(
+            &socket,
+            duration,
+            config.expected_pps,
+            config.buffer_size,
+        )
+        .await?;
+        println!("One-way send mode stats: bytes={}, packets={}, out_of_order={}, loss={:?}%",
+            stats.bytes_received, stats.packets_received, stats.out_of_order, stats.packet_loss);
+    } else if config.one_way == OneWayMode::Receive {
+        // One-way receive mode: server sends, client receives only
+        send_udp_data(
+            client_addr,
+            duration,
+            bandwidth,
+            buffer_size,
+            &measurements,
+            &config,
+            udp_buffer_pool.clone(),
+        )
+        .await?;
+    } else if reverse {
         // Server sends UDP data to client
         send_udp_data(
             client_addr,
@@ -1312,4 +1349,65 @@ async fn receive_data(
     measurements.set_duration(start.elapsed());
 
     Ok(())
+}
+
+/// One-way receive statistics on server side.
+///
+/// Collects statistics when the server receives data in one-way send mode,
+/// including packet loss calculation based on expected PPS.
+pub async fn recv_one_way_server(
+    socket: &UdpSocket,
+    duration: Duration,
+    expected_pps: Option<u64>,
+    buffer_size: usize,
+) -> Result<ServerOneWayStats> {
+    let start = Instant::now();
+    let mut bytes_received: u64 = 0;
+    let mut packets_received: u64 = 0;
+    let mut out_of_order: u64 = 0;
+    let mut last_seq: u32 = 0;
+
+    let mut buf = vec![0u8; buffer_size];
+
+    while start.elapsed() < duration {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, _)) => {
+                bytes_received += n as u64;
+                packets_received += 1;
+
+                // Sequence number detection for out-of-order
+                if n >= 4 {
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    if last_seq > 0 && seq < last_seq {
+                        out_of_order += 1;
+                    }
+                    last_seq = seq;
+                }
+            }
+            Err(e) => {
+                error!("Receive error: {}", e);
+                return Err(Error::Io(e));
+            }
+        }
+    }
+
+    // Calculate packet loss
+    let expected_packets = expected_pps.map(|pps| pps * duration.as_secs());
+    let packet_loss = expected_packets.map(|expected| {
+        if packets_received > expected {
+            0.0  // No loss when we received more than expected (e.g., extra retransmits)
+        } else if expected > 0 {
+            ((expected - packets_received) as f64 / expected as f64) * 100.0
+        } else {
+            0.0
+        }
+    });
+
+    Ok(ServerOneWayStats {
+        bytes_received,
+        packets_received,
+        out_of_order,
+        packet_loss,
+        duration: start.elapsed(),
+    })
 }

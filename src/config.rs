@@ -67,6 +67,27 @@ pub enum Mode {
     Client,
 }
 
+/// One-way test mode for unidirectional testing.
+///
+/// Allows tests where traffic flows in only one direction:
+/// - Send: Client sends, server receives only (no reverse traffic)
+/// - Receive: Server sends, client receives only (no reverse traffic)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OneWayMode {
+    /// No one-way mode (use Normal/Reverse)
+    None,
+    /// Client sends, server receives (no reverse traffic)
+    Send,
+    /// Server sends, client receives (no reverse traffic)
+    Receive,
+}
+
+impl Default for OneWayMode {
+    fn default() -> Self {
+        OneWayMode::None
+    }
+}
+
 /// Configuration for rperf3 network performance tests.
 ///
 /// This structure holds all configuration parameters for both client and server modes.
@@ -153,6 +174,12 @@ pub struct Config {
 
     /// Interval for periodic bandwidth reports in seconds
     pub interval: Duration,
+
+    /// One-way test mode (None/Send/Receive)
+    pub one_way: OneWayMode,
+
+    /// Expected packets per second for one-way mode (for packet loss calculation)
+    pub expected_pps: Option<u64>,
 }
 
 impl Default for Config {
@@ -170,6 +197,8 @@ impl Default for Config {
             reverse: false,
             json: false,
             interval: Duration::from_secs(1),
+            one_way: OneWayMode::None,
+            expected_pps: None,
         }
     }
 }
@@ -418,6 +447,66 @@ impl Config {
     /// ```
     pub fn with_interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
+        self
+    }
+
+    /// Enable one-way send mode (client sends, server receives only).
+    ///
+    /// In one-way send mode, the client only sends data and the server
+    /// only receives it, without any reverse traffic or heartbeats.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rperf3::Config;
+    ///
+    /// let config = Config::client("127.0.0.1".to_string(), 5201)
+    ///     .with_one_way_send();
+    /// ```
+    pub fn with_one_way_send(mut self) -> Self {
+        self.one_way = OneWayMode::Send;
+        self
+    }
+
+    /// Enable one-way receive mode (server sends, client receives only).
+    ///
+    /// In one-way receive mode, the server only sends data and the client
+    /// only receives it, without any reverse traffic or heartbeats.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rperf3::Config;
+    ///
+    /// let config = Config::client("127.0.0.1".to_string(), 5201)
+    ///     .with_one_way_receive();
+    /// ```
+    pub fn with_one_way_receive(mut self) -> Self {
+        self.one_way = OneWayMode::Receive;
+        self
+    }
+
+    /// Set expected packets per second for one-way packet loss calculation.
+    ///
+    /// When set, the receiver can calculate packet loss percentage based on
+    /// the expected PPS value. This is useful for one-way tests where the sender
+    /// knows its actual sending rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `pps` - Expected packets per second
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rperf3::Config;
+    ///
+    /// let config = Config::client("127.0.0.1".to_string(), 5201)
+    ///     .with_one_way_send()
+    ///     .with_expected_pps(1_000_000);
+    /// ```
+    pub fn with_expected_pps(mut self, pps: u64) -> Self {
+        self.expected_pps = Some(pps);
         self
     }
 }

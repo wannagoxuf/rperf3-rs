@@ -78,6 +78,10 @@ pub enum Message {
         buffer_size: usize,
         parallel: usize,
         reverse: bool,
+        /// One-way mode: "send" / "receive" / null
+        one_way: Option<String>,
+        /// Expected packets per second for one-way packet loss calculation
+        expected_pps: Option<u64>,
     },
 
     /// Server acknowledgment of setup
@@ -103,6 +107,16 @@ pub enum Message {
         duration: f64,
         bits_per_second: f64,
         retransmits: Option<u64>,
+        /// Packets sent (one-way mode)
+        packets_sent: Option<u64>,
+        /// Packets received (one-way mode)
+        packets_received: Option<u64>,
+        /// Packet loss percentage (one-way mode)
+        packet_loss: Option<f64>,
+        /// Jitter in milliseconds (one-way mode)
+        jitter_ms: Option<f64>,
+        /// Out-of-order packets count (one-way mode)
+        out_of_order: Option<u64>,
     },
 
     /// Test completion signal
@@ -139,6 +153,43 @@ impl Message {
             buffer_size,
             parallel,
             reverse,
+            one_way: None,
+            expected_pps: None,
+        }
+    }
+
+    /// Creates a Setup message with one-way mode support.
+    ///
+    /// # Arguments
+    ///
+    /// * `protocol` - Protocol name ("TCP" or "UDP")
+    /// * `duration` - Test duration
+    /// * `bandwidth` - Target bandwidth for UDP (None for TCP)
+    /// * `buffer_size` - Buffer size in bytes
+    /// * `parallel` - Number of parallel streams
+    /// * `reverse` - Whether to use reverse mode
+    /// * `one_way` - One-way mode ("send" / "receive" / None)
+    /// * `expected_pps` - Expected packets per second for loss calculation
+    pub fn setup_with_one_way(
+        protocol: String,
+        duration: Duration,
+        bandwidth: Option<u64>,
+        buffer_size: usize,
+        parallel: usize,
+        reverse: bool,
+        one_way: Option<String>,
+        expected_pps: Option<u64>,
+    ) -> Self {
+        Message::Setup {
+            version: PROTOCOL_VERSION,
+            protocol,
+            duration: duration.as_secs(),
+            bandwidth,
+            buffer_size,
+            parallel,
+            reverse,
+            one_way,
+            expected_pps,
         }
     }
 
@@ -211,6 +262,54 @@ impl Message {
             duration,
             bits_per_second,
             retransmits,
+            packets_sent: None,
+            packets_received: None,
+            packet_loss: None,
+            jitter_ms: None,
+            out_of_order: None,
+        }
+    }
+
+    /// Creates a Result message with one-way statistics.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - Stream identifier
+    /// * `bytes_sent` - Total bytes sent
+    /// * `bytes_received` - Total bytes received
+    /// * `duration` - Test duration in seconds
+    /// * `bits_per_second` - Average throughput
+    /// * `retransmits` - TCP retransmit count (None for UDP)
+    /// * `packets_sent` - Packets sent
+    /// * `packets_received` - Packets received
+    /// * `packet_loss` - Packet loss percentage
+    /// * `jitter_ms` - Jitter in milliseconds
+    /// * `out_of_order` - Out-of-order packets count
+    pub fn result_one_way(
+        stream_id: usize,
+        bytes_sent: u64,
+        bytes_received: u64,
+        duration: f64,
+        bits_per_second: f64,
+        retransmits: Option<u64>,
+        packets_sent: u64,
+        packets_received: u64,
+        packet_loss: f64,
+        jitter_ms: f64,
+        out_of_order: u64,
+    ) -> Self {
+        Message::Result {
+            stream_id,
+            bytes_sent,
+            bytes_received,
+            duration,
+            bits_per_second,
+            retransmits,
+            packets_sent: Some(packets_sent),
+            packets_received: Some(packets_received),
+            packet_loss: Some(packet_loss),
+            jitter_ms: Some(jitter_ms),
+            out_of_order: Some(out_of_order),
         }
     }
 

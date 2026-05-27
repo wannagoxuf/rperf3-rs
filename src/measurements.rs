@@ -2260,3 +2260,52 @@ mod tests {
         assert_eq!(deserialized.len(), 1);
     }
 }
+
+/// Statistics for one-way send operation (client side).
+///
+/// Records the statistics when sending data in one-way send mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OneWaySendStats {
+    /// Total bytes sent
+    pub bytes_sent: u64,
+    /// Total packets sent
+    pub packets_sent: u64,
+    /// Test duration
+    pub duration: Duration,
+}
+
+/// Statistics for one-way receive operation (client side).
+///
+/// Records the statistics when receiving data in one-way receive mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OneWayRecvStats {
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Total packets received
+    pub packets_received: u64,
+    /// Out-of-order packets count
+    pub out_of_order: u64,
+    /// Packet loss percentage
+    pub packet_loss: Option<f64>,
+    /// Average jitter in milliseconds (RFC 3550)
+    pub jitter_ms: f64,
+    /// Test duration
+    pub duration: Duration,
+}
+
+/// Statistics for one-way receive operation on server side.
+///
+/// Records the statistics when the server receives data in one-way send mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerOneWayStats {
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Total packets received
+    pub packets_received: u64,
+    /// Out-of-order packets count
+    pub out_of_order: u64,
+    /// Packet loss percentage
+    pub packet_loss: Option<f64>,
+    /// Test duration
+    pub duration: Duration,
+}

@@ -175,6 +175,18 @@ enum Commands {
         /// Interval between periodic reports in seconds [default: 1]
         #[arg(short, long, value_name = "SECONDS", default_value = "1")]
         interval: u64,
+
+        /// One-way send mode: client sends, server receives only (no reverse traffic)
+        #[arg(long)]
+        one_way_send: bool,
+
+        /// One-way receive mode: server sends, client receives only (no reverse traffic)
+        #[arg(long)]
+        one_way_receive: bool,
+
+        /// Expected packets per second for one-way packet loss calculation
+        #[arg(long, value_name = "PPS")]
+        expected_pps: Option<u64>,
     },
 }
 
@@ -223,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
             reverse,
             json,
             interval,
+            one_way_send,
+            one_way_receive,
+            expected_pps,
         } => {
             let protocol = if udp { Protocol::Udp } else { Protocol::Tcp };
 
@@ -241,6 +256,17 @@ async fn main() -> anyhow::Result<()> {
                 .with_reverse(reverse)
                 .with_json(json)
                 .with_interval(Duration::from_secs(interval));
+
+            // Apply one-way mode settings
+            if one_way_send {
+                config = config.with_one_way_send();
+            } else if one_way_receive {
+                config = config.with_one_way_receive();
+            }
+
+            if let Some(pps) = expected_pps {
+                config = config.with_expected_pps(pps);
+            }
 
             if let Some(bw_str) = bandwidth {
                 let bw = parse_bandwidth(&bw_str)?;

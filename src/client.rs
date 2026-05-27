@@ -1,9 +1,9 @@
 use crate::buffer_pool::BufferPool;
-use crate::config::{Config, Protocol};
+use crate::config::{Config, OneWayMode, Protocol};
 use crate::interval_reporter::{run_reporter_task, IntervalReport, IntervalReporter};
 use crate::measurements::{
     get_connection_info, get_system_info, get_tcp_stats, IntervalStats, MeasurementsCollector,
-    TestConfig,
+    TestConfig, OneWaySendStats, OneWayRecvStats,
 };
 use crate::protocol::{deserialize_message, serialize_message, Message, DEFAULT_STREAM_ID};
 use crate::{Error, Result};
@@ -560,14 +560,32 @@ impl Client {
         let system_info = Some(get_system_info());
 
         // Send setup message
-        let setup = Message::setup(
-            self.config.protocol.as_str().to_string(),
-            self.config.duration,
-            self.config.bandwidth,
-            self.config.buffer_size,
-            self.config.parallel,
-            self.config.reverse,
-        );
+        let (one_way_str, expected_pps) = match self.config.one_way {
+            OneWayMode::Send => (Some("send".to_string()), self.config.expected_pps),
+            OneWayMode::Receive => (Some("receive".to_string()), self.config.expected_pps),
+            OneWayMode::None => (None, None),
+        };
+        let setup = if one_way_str.is_some() {
+            Message::setup_with_one_way(
+                self.config.protocol.as_str().to_string(),
+                self.config.duration,
+                self.config.bandwidth,
+                self.config.buffer_size,
+                self.config.parallel,
+                self.config.reverse,
+                one_way_str,
+                expected_pps,
+            )
+        } else {
+            Message::setup(
+                self.config.protocol.as_str().to_string(),
+                self.config.duration,
+                self.config.bandwidth,
+                self.config.buffer_size,
+                self.config.parallel,
+                self.config.reverse,
+            )
+        };
         let setup_bytes = serialize_message(&setup)?;
         stream.write_all(&setup_bytes).await?;
         stream.flush().await?;
@@ -731,14 +749,32 @@ impl Client {
         configure_tcp_socket(&control_stream)?;
 
         // Send setup message via TCP
-        let setup = Message::setup(
-            self.config.protocol.as_str().to_string(),
-            self.config.duration,
-            self.config.bandwidth,
-            self.config.buffer_size,
-            self.config.parallel,
-            self.config.reverse,
-        );
+        let (one_way_str, expected_pps) = match self.config.one_way {
+            OneWayMode::Send => (Some("send".to_string()), self.config.expected_pps),
+            OneWayMode::Receive => (Some("receive".to_string()), self.config.expected_pps),
+            OneWayMode::None => (None, None),
+        };
+        let setup = if one_way_str.is_some() {
+            Message::setup_with_one_way(
+                self.config.protocol.as_str().to_string(),
+                self.config.duration,
+                self.config.bandwidth,
+                self.config.buffer_size,
+                self.config.parallel,
+                self.config.reverse,
+                one_way_str,
+                expected_pps,
+            )
+        } else {
+            Message::setup(
+                self.config.protocol.as_str().to_string(),
+                self.config.duration,
+                self.config.bandwidth,
+                self.config.buffer_size,
+                self.config.parallel,
+                self.config.reverse,
+            )
+        };
         let setup_bytes = serialize_message(&setup)?;
         control_stream.write_all(&setup_bytes).await?;
         control_stream.flush().await?;
@@ -798,7 +834,32 @@ impl Client {
             println!("[ ID] Interval           Transfer        Bitrate            Total Datagrams");
         }
 
-        let result = if self.config.reverse {
+        let result = if self.config.one_way == OneWayMode::Send {
+            // One-way send mode: client sends, server receives only
+            let stats = send_one_way(
+                &socket,
+                socket.peer_addr()?,
+                self.config.duration,
+                self.config.bandwidth,
+                &[0u8; 1024],
+            )
+            .await?;
+            println!("One-way send stats: bytes={}, packets={}, duration={:?}",
+                stats.bytes_sent, stats.packets_sent, stats.duration);
+            Ok(())
+        } else if self.config.one_way == OneWayMode::Receive {
+            // One-way receive mode: server sends, client receives only
+            let stats = recv_one_way(
+                &socket,
+                self.config.duration,
+                self.config.expected_pps,
+                self.config.buffer_size,
+            )
+            .await?;
+            println!("One-way receive stats: bytes={}, packets={}, out_of_order={}, loss={:?}%, jitter={:.3}ms",
+                stats.bytes_received, stats.packets_received, stats.out_of_order, stats.packet_loss, stats.jitter_ms);
+            Ok(())
+        } else if self.config.reverse {
             // Reverse mode: Send one initialization packet to let server know our UDP port
             let init_packet = crate::udp_packet::create_packet(0, 0);
             socket.send(&init_packet).await?;
@@ -1771,4 +1832,125 @@ fn print_results(measurements: &crate::Measurements, stream_id: usize, _reverse:
 
         println!();
     }
+}
+
+/// One-way send: only sends data without waiting for response.
+///
+/// This is used in one-way send mode where the client sends data
+/// and the server only receives it without any reverse traffic.
+pub async fn send_one_way(
+    socket: &UdpSocket,
+    addr: std::net::SocketAddr,
+    duration: Duration,
+    bandwidth: Option<u64>,
+    buffer: &[u8],
+) -> Result<OneWaySendStats> {
+    let start = Instant::now();
+    let mut bytes_sent: u64 = 0;
+    let mut packets_sent: u64 = 0;
+    let mut token_bucket = bandwidth.map(|bw| crate::token_bucket::TokenBucket::new(bw / 8));
+
+    while start.elapsed() < duration {
+        match socket.send_to(buffer, addr).await {
+            Ok(n) => {
+                bytes_sent += n as u64;
+                packets_sent += 1;
+            }
+            Err(e) => {
+                error!("Send error: {}", e);
+                return Err(Error::Io(e));
+            }
+        }
+
+        // Rate limiting
+        if let Some(ref mut tb) = token_bucket {
+            tb.consume(buffer.len()).await;
+        }
+    }
+
+    Ok(OneWaySendStats {
+        bytes_sent,
+        packets_sent,
+        duration: start.elapsed(),
+    })
+}
+
+/// One-way receive: only receives data without sending response.
+///
+/// This is used in one-way receive mode where the server sends data
+/// and the client only receives it without any reverse traffic.
+pub async fn recv_one_way(
+    socket: &UdpSocket,
+    duration: Duration,
+    expected_pps: Option<u64>,
+    buffer_size: usize,
+) -> Result<OneWayRecvStats> {
+    let start = Instant::now();
+    let mut bytes_received: u64 = 0;
+    let mut packets_received: u64 = 0;
+    let mut out_of_order: u64 = 0;
+    let mut last_seq: u32 = 0;
+    let mut jitter_samples: Vec<f64> = Vec::new();
+    let mut last_arrival_time: Option<Instant> = None;
+
+    let mut buf = vec![0u8; buffer_size];
+
+    while start.elapsed() < duration {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, _)) => {
+                bytes_received += n as u64;
+                packets_received += 1;
+
+                // Parse sequence number for out-of-order detection
+                if n >= 4 {
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    if last_seq > 0 && seq < last_seq {
+                        out_of_order += 1;
+                    }
+                    last_seq = seq;
+                }
+
+                // Jitter calculation (RFC 3550)
+                let now = Instant::now();
+                if let Some(prev) = last_arrival_time {
+                    let transit = now.duration_since(prev).as_secs_f64();
+                    let curr_jitter = jitter_samples.last().unwrap_or(&0.0);
+                    jitter_samples.push(*curr_jitter + (transit - *curr_jitter).abs() / 16.0);
+                }
+                last_arrival_time = Some(now);
+            }
+            Err(e) => {
+                error!("Receive error: {}", e);
+                return Err(Error::Io(e));
+            }
+        }
+    }
+
+    // Calculate packet loss
+    let expected_packets = expected_pps.map(|pps| pps * duration.as_secs());
+    let packet_loss = expected_packets.map(|expected| {
+        if packets_received > expected {
+            0.0
+        } else if expected > 0 {
+            ((expected - packets_received) as f64 / expected as f64) * 100.0
+        } else {
+            0.0
+        }
+    });
+
+    // Calculate average jitter
+    let jitter_ms = if !jitter_samples.is_empty() {
+        jitter_samples.iter().sum::<f64>() / jitter_samples.len() as f64 * 1000.0
+    } else {
+        0.0
+    };
+
+    Ok(OneWayRecvStats {
+        bytes_received,
+        packets_received,
+        out_of_order,
+        packet_loss,
+        jitter_ms,
+        duration: start.elapsed(),
+    })
 }
