@@ -129,7 +129,7 @@ rperf3 client 192.168.1.100 -u -b 1G -l 8192
 
 ### One-Way UDP Tests
 
-True unidirectional throughput testing — server side reports real-time per-second receive rate and packet loss independently, without relying on client-side statistics.
+True unidirectional throughput testing — server reports real-time per-second receive rate and packet loss independently, without relying on client-side statistics.
 
 ```bash
 # Terminal 1 - Start server in UDP mode
@@ -137,9 +137,27 @@ True unidirectional throughput testing — server side reports real-time per-sec
 
 # Terminal 2 - Client sends one-way (server receives and measures)
 ./target/release/rperf3 client 127.0.0.1 --udp --one-way-send --time 10
+
+# Multi-stream test (4 parallel streams for higher throughput)
+./target/release/rperf3 client 127.0.0.1 --udp --one-way-send -P 4 -t 30 -b 2G
 ```
 
-Server-side output (every second):
+**Parameter explanations:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `--udp` | Use UDP protocol (required for one-way mode) |
+| `--one-way-send` | Client sends only; server receives and measures (no reverse traffic) |
+| `--one-way-receive` | Server sends only; client receives (experimental) |
+| `-P <NUM>` | Number of parallel streams (default: 1). More streams = higher throughput |
+| `-b <RATE>` | Target bandwidth, e.g. `1G` = 1 Gbps, `500M` = 500 Mbps |
+| `-t <SEC>` | Test duration in seconds (default: 10) |
+| `-p <PORT>` | Server port (default: 5201) |
+| `-l <SIZE>` | Packet size in bytes (default: 1500 for UDP) |
+| `-i <SEC>` | Report interval in seconds (default: 1) |
+| `--expected-pps <PPS>` | Expected packets/sec for loss calculation (optional) |
+
+**Server-side output (every second):**
 ```
 [1.0s] recv rate: 2.495 Gbps, packets=207895, bytes=311842500, lost=0, loss=0.00%
 [2.0s] recv rate: 2.010 Gbps, packets=375364, bytes=563046000, lost=0, loss=0.00%
@@ -147,10 +165,8 @@ Server-side output (every second):
 [10.0s] recv rate: 2.157 Gbps, total packets=898912, bytes=1348368000, out_of_order=0, lost=0, loss=0.00%
 ```
 
-- **`--one-way-send`**: Client sends UDP packets with sequence numbers; server independently measures loss via sequence number gaps
-- **`--one-way-receive`**: Client waits for UDP packets; server sends unidirectionally to the client's UDP port (experimental)
-- Per-second stats show: receive rate (Gbps), cumulative packets/bytes, lost packet count, and loss percentage
 - Loss detection uses per-packet sequence numbers (first 4 bytes of each UDP packet) — no reliance on sender's expected packet rate
+- Multiple streams (`-P`) each use a unique stream ID, allowing the server to track per-stream loss independently on a single socket
 
 ### Server Options
 
