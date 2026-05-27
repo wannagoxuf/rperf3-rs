@@ -42,6 +42,8 @@ Built from the ground up in Rust, rperf3-rs leverages modern async I/O (via Toki
 - **Socket Optimizations**: TCP_NODELAY and enlarged buffers for maximum throughput
 - **Library & CLI**: Use as a standalone tool or integrate as a Rust library
 - **One-Way UDP Testing**: True unidirectional throughput measurement with per-second loss detection
+- **Multi-Stream Support**: Parallel streams with unique stream IDs for independent per-stream loss tracking
+- **Socket Buffer Tuning**: Configurable UDP buffer size (`-B`) to prevent kernel-level drops
 - **Cross-Platform**: Linux, macOS, and Windows support
 
 ## Quick Start
@@ -140,6 +142,10 @@ True unidirectional throughput testing — server reports real-time per-second r
 
 # Multi-stream test (4 parallel streams for higher throughput)
 ./target/release/rperf3 client 127.0.0.1 --udp --one-way-send -P 4 -t 30 -b 2G
+
+# Increase socket buffers to prevent kernel-level drops
+./target/release/rperf3 server --udp -B 64M
+./target/release/rperf3 client 127.0.0.1 --udp --one-way-send -B 64M -t 10
 ```
 
 **Parameter explanations:**
@@ -155,6 +161,7 @@ True unidirectional throughput testing — server reports real-time per-second r
 | `-p <PORT>` | Server port (default: 5201) |
 | `-l <SIZE>` | Packet size in bytes (default: 1500 for UDP) |
 | `-i <SEC>` | Report interval in seconds (default: 1) |
+| `-B <SIZE>` | Socket buffer size, e.g. `32M`, `64M`, `1G` (default: 32M). 0 = system default |
 | `--expected-pps <PPS>` | Expected packets/sec for loss calculation (optional) |
 
 **Server-side output (every second):**
@@ -319,6 +326,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `--bind <ADDRESS>`  | `-b`  | Bind to specific address | 0.0.0.0 |
 | `--udp`             | `-u`  | UDP mode                 | TCP     |
 | `--json`            | `-J`  | JSON output              | false   |
+| `--interval <SEC>`  | `-i`  | Report interval          | 1       |
+| `--socket-buf <S>`  | `-B`  | Socket buffer size (32M) | 32M     |
 
 ### Client
 
@@ -334,6 +343,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `--reverse`            | `-R`  | Reverse mode (server sends)     | false                     |
 | `--json`               | `-J`  | JSON output                     | false                     |
 | `--interval <SECONDS>` | `-i`  | Report interval                 | 1                         |
+| `--one-way-send`       |       | One-way send mode               | false                     |
+| `--socket-buf <SIZE>`  | `-B`  | Socket buffer size              | 32M                       |
 
 ### Bandwidth Notation
 
@@ -451,6 +462,8 @@ Output includes:
 - ✅ **One-Way UDP Testing**: True unidirectional UDP throughput with per-second receive rate and packet loss stats
 - ✅ **Sequence-Number Loss Detection**: Server independently detects lost packets via per-packet sequence numbers (first 4 bytes of each UDP packet)
 - ✅ **Per-Second Gbps Reporting**: Server-side real-time output every second showing recv rate in Gbps, cumulative packets/bytes, lost count, and loss percentage
+- ✅ **Socket Buffer Size Option**: Added `-B/--socket-buf` to set UDP socket buffer size (e.g. `32M`, `64M`, `1G`) to prevent kernel-level drops
+- ✅ **Multi-Stream Support**: Parallel streams (`-P`) each use unique stream ID for independent per-stream loss tracking
 - ✅ **Readme Updated**: Added one-way UDP documentation with usage examples
 
 ### v0.6.1 (Current)
