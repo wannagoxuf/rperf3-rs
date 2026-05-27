@@ -88,6 +88,10 @@ mod tests {
     One-way UDP send with bandwidth limit:
         rperf3 client 192.168.1.100 --udp --one-way-send -b 1G -t 30
 
+    One-way UDP with custom port (to avoid conflicts):
+        Terminal 1: rperf3 server --udp -p 5202
+        Terminal 2: rperf3 client 127.0.0.1 --udp --one-way-send -p 5202 -t 10
+
     Run TCP test:
         rperf3 client 192.168.1.100
         rperf3 client 192.168.1.100 --time 30 --interval 2
