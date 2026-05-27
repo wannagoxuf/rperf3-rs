@@ -77,9 +77,16 @@ mod tests {
         rperf3 server --port 5201 --bind 192.168.1.100
         rperf3 server -p 5201 -J --interval 2
 
-    Start UDP server:
+    Start UDP server (required for one-way testing):
         rperf3 server --udp
         rperf3 server -u -J -i 2
+
+    One-way UDP send test (server receives, measures loss):
+        Terminal 1: rperf3 server --udp
+        Terminal 2: rperf3 client 127.0.0.1 --udp --one-way-send --time 10
+
+    One-way UDP send with bandwidth limit:
+        rperf3 client 192.168.1.100 --udp --one-way-send -b 1G -t 30
 
     Run TCP test:
         rperf3 client 192.168.1.100
