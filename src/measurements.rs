@@ -2304,6 +2304,8 @@ pub struct ServerOneWayStats {
     pub packets_received: u64,
     /// Out-of-order packets count
     pub out_of_order: u64,
+    /// Cumulative packets lost (detected via sequence number gaps)
+    pub packets_lost: u64,
     /// Packet loss percentage
     pub packet_loss: Option<f64>,
     /// Test duration

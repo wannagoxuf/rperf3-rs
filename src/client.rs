@@ -836,12 +836,13 @@ impl Client {
 
         let result = if self.config.one_way == OneWayMode::Send {
             // One-way send mode: client sends, server receives only
+            let mut buffer = vec![0u8; self.config.buffer_size];
             let stats = send_one_way(
                 &socket,
                 socket.peer_addr()?,
                 self.config.duration,
                 self.config.bandwidth,
-                &[0u8; 1024],
+                &mut buffer,
             )
             .await?;
             println!("One-way send stats: bytes={}, packets={}, duration={:?}",
@@ -1843,14 +1844,19 @@ pub async fn send_one_way(
     addr: std::net::SocketAddr,
     duration: Duration,
     bandwidth: Option<u64>,
-    buffer: &[u8],
+    buffer: &mut [u8],
 ) -> Result<OneWaySendStats> {
     let start = Instant::now();
     let mut bytes_sent: u64 = 0;
     let mut packets_sent: u64 = 0;
+    let mut seq: u32 = 0;
     let mut token_bucket = bandwidth.map(|bw| crate::token_bucket::TokenBucket::new(bw / 8));
 
     while start.elapsed() < duration {
+        // Write sequence number into first 4 bytes of packet
+        buffer[0..4].copy_from_slice(&seq.to_be_bytes());
+        seq = seq.wrapping_add(1);
+
         match socket.send_to(buffer, addr).await {
             Ok(n) => {
                 bytes_sent += n as u64;

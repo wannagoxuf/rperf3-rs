@@ -810,8 +810,8 @@ async fn handle_udp_test(
         .await?;
         info!("recv_one_way_server returned: bytes={}, packets={}", 
               stats.bytes_received, stats.packets_received);
-        println!("One-way send mode stats: bytes={}, packets={}, out_of_order={}, loss={:?}%",
-            stats.bytes_received, stats.packets_received, stats.out_of_order, stats.packet_loss);
+        println!("One-way send mode stats: bytes={}, packets={}, out_of_order={}, lost={}, loss={:.2}%",
+            stats.bytes_received, stats.packets_received, stats.out_of_order, stats.packets_lost, stats.packet_loss.unwrap_or(0.0));
     } else if config.one_way == OneWayMode::Receive {
         // One-way receive mode: server sends, client receives only
         send_udp_data(
@@ -1360,7 +1360,7 @@ async fn receive_data(
 pub async fn recv_one_way_server(
     socket: &UdpSocket,
     duration: Duration,
-    expected_pps: Option<u64>,
+    _expected_pps: Option<u64>,
     buffer_size: usize,
 ) -> Result<ServerOneWayStats> {
     
@@ -1370,7 +1370,8 @@ pub async fn recv_one_way_server(
     let mut bytes_received: u64 = 0;
     let mut packets_received: u64 = 0;
     let mut out_of_order: u64 = 0;
-    let mut last_seq: u32 = 0;
+    let mut packets_lost: u64 = 0;
+    let mut expected_seq: u32 = 0;
 
     // Per-interval tracking for rate calculation
     let mut interval_bytes: u64 = 0;
@@ -1416,13 +1417,22 @@ pub async fn recv_one_way_server(
                 interval_bytes += n as u64;
                 packets_received += 1;
 
-                // Parse sequence number for out-of-order detection
+                // Parse sequence number for loss/out-of-order detection
                 if n >= 4 {
                     let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                    if last_seq > 0 && seq < last_seq {
-                        out_of_order += 1;
+                    if expected_seq == 0 {
+                        expected_seq = seq;
                     }
-                    last_seq = seq;
+                    if seq > expected_seq {
+                        // Gap detected: packets were lost
+                        packets_lost += (seq - expected_seq) as u64;
+                        expected_seq = seq.wrapping_add(1);
+                    } else if seq < expected_seq {
+                        // Out-of-order: received a sequence we've seen before or a late packet
+                        out_of_order += 1;
+                    } else {
+                        expected_seq = expected_seq.wrapping_add(1);
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -1435,23 +1445,19 @@ pub async fn recv_one_way_server(
         }
     }
 
-    // Calculate packet loss for final summary
-    let expected_total = expected_pps.map(|pps| pps * duration.as_secs());
-    let packet_loss = expected_total.map(|expected| {
-        if packets_received > expected {
-            0.0
-        } else if expected > 0 {
-            ((expected - packets_received) as f64 / expected as f64) * 100.0
-        } else {
-            0.0
-        }
-    });
+    // Calculate packet loss based on sequence number gaps
+    let total_sent = packets_received + packets_lost;
+    let packet_loss = if total_sent > 0 {
+        Some((packets_lost as f64 / total_sent as f64) * 100.0)
+    } else {
+        None
+    };
 
     // Print final summary
     let total_elapsed = start.elapsed().as_secs_f64();
     let final_rate_gbps = (bytes_received as f64 * 8.0) / (total_elapsed * 1e9);
     let loss_str = match packet_loss {
-        Some(loss) => format!(", loss={:.2}%", loss),
+        Some(loss) => format!(", lost={}, loss={:.2}%", packets_lost, loss),
         None => String::new(),
     };
     println!(
@@ -1470,6 +1476,7 @@ pub async fn recv_one_way_server(
         bytes_received,
         packets_received,
         out_of_order,
+        packets_lost,
         packet_loss,
         duration: start.elapsed(),
     })
