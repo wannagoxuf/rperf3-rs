@@ -41,6 +41,7 @@ Built from the ground up in Rust, rperf3-rs leverages modern async I/O (via Toki
 - **Buffer Pooling**: Optimized memory allocation for 10-20% performance improvement
 - **Socket Optimizations**: TCP_NODELAY and enlarged buffers for maximum throughput
 - **Library & CLI**: Use as a standalone tool or integrate as a Rust library
+- **One-Way UDP Testing**: True unidirectional throughput measurement with per-second loss detection
 - **Cross-Platform**: Linux, macOS, and Windows support
 
 ## Quick Start
@@ -125,6 +126,31 @@ rperf3 client 192.168.1.100 -u -R -b 50M
 # UDP with custom buffer size
 rperf3 client 192.168.1.100 -u -b 1G -l 8192
 ```
+
+### One-Way UDP Tests
+
+True unidirectional throughput testing — server side reports real-time per-second receive rate and packet loss independently, without relying on client-side statistics.
+
+```bash
+# Terminal 1 - Start server in UDP mode
+./target/release/rperf3 server --udp
+
+# Terminal 2 - Client sends one-way (server receives and measures)
+./target/release/rperf3 client 127.0.0.1 --udp --one-way-send --time 10
+```
+
+Server-side output (every second):
+```
+[1.0s] recv rate: 2.495 Gbps, packets=207895, bytes=311842500, lost=0, loss=0.00%
+[2.0s] recv rate: 2.010 Gbps, packets=375364, bytes=563046000, lost=0, loss=0.00%
+...
+[10.0s] recv rate: 2.157 Gbps, total packets=898912, bytes=1348368000, out_of_order=0, lost=0, loss=0.00%
+```
+
+- **`--one-way-send`**: Client sends UDP packets with sequence numbers; server independently measures loss via sequence number gaps
+- **`--one-way-receive`**: Client waits for UDP packets; server sends unidirectionally to the client's UDP port (experimental)
+- Per-second stats show: receive rate (Gbps), cumulative packets/bytes, lost packet count, and loss percentage
+- Loss detection uses per-packet sequence numbers (first 4 bytes of each UDP packet) — no reliance on sender's expected packet rate
 
 ### Server Options
 
@@ -403,6 +429,13 @@ Output includes:
 - **`config`**: Configuration builder with validation
 
 ## Recent Updates
+
+### v0.6.2
+
+- ✅ **One-Way UDP Testing**: True unidirectional UDP throughput with per-second receive rate and packet loss stats
+- ✅ **Sequence-Number Loss Detection**: Server independently detects lost packets via per-packet sequence numbers (first 4 bytes of each UDP packet)
+- ✅ **Per-Second Gbps Reporting**: Server-side real-time output every second showing recv rate in Gbps, cumulative packets/bytes, lost count, and loss percentage
+- ✅ **Readme Updated**: Added one-way UDP documentation with usage examples
 
 ### v0.6.1 (Current)
 
