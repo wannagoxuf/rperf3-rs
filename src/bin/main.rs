@@ -28,6 +28,32 @@ fn parse_bandwidth(s: &str) -> anyhow::Result<u64> {
     Ok(number * multiplier)
 }
 
+/// Parse byte size string with K/M/G suffix (in bytes)
+/// Examples: "32M" = 32 MB, "1G" = 1 GB, "256K" = 256 KB
+fn parse_byte_size(s: &str) -> anyhow::Result<usize> {
+    let s = s.trim();
+
+    if s.is_empty() {
+        anyhow::bail!("Byte size cannot be empty");
+    }
+
+    let (number_str, multiplier) = if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len() - 1], 1_073_741_824usize)
+    } else if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len() - 1], 1_048_576usize)
+    } else if s.ends_with('K') || s.ends_with('k') {
+        (&s[..s.len() - 1], 1024usize)
+    } else {
+        (s, 1usize)
+    };
+
+    let number: usize = number_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid byte size number: {}", number_str))?;
+
+    Ok(number * multiplier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +171,10 @@ enum Commands {
         /// Interval between periodic reports in seconds [default: 1]
         #[arg(short, long, value_name = "SECONDS", default_value = "1")]
         interval: u64,
+
+        /// Socket buffer size in bytes (e.g. 32M, 64M) [default: 32M]
+        #[arg(short = 'B', long, value_name = "BYTES")]
+        socket_buf: Option<String>,
     },
 
     /// Start client mode and connect to a server
@@ -202,6 +232,10 @@ enum Commands {
         /// Expected packets per second for one-way packet loss calculation
         #[arg(long, value_name = "PPS")]
         expected_pps: Option<u64>,
+
+        /// Socket buffer size in bytes (e.g. 32M, 64M) [default: 32M]
+        #[arg(short = 'B', long, value_name = "BYTES")]
+        socket_buf: Option<String>,
     },
 }
 
@@ -223,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
             udp,
             json,
             interval,
+            socket_buf,
         } => {
             let protocol = if udp { Protocol::Udp } else { Protocol::Tcp };
 
@@ -233,6 +268,10 @@ async fn main() -> anyhow::Result<()> {
 
             if let Some(bind_addr) = bind {
                 config.bind_addr = Some(bind_addr.parse()?);
+            }
+
+            if let Some(s) = socket_buf {
+                config = config.with_socket_buf(parse_byte_size(&s)?);
             }
 
             let server = Server::new(config);
@@ -253,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
             one_way_send,
             one_way_receive,
             expected_pps,
+            socket_buf,
         } => {
             let protocol = if udp { Protocol::Udp } else { Protocol::Tcp };
 
@@ -286,6 +326,10 @@ async fn main() -> anyhow::Result<()> {
             if let Some(bw_str) = bandwidth {
                 let bw = parse_bandwidth(&bw_str)?;
                 config = config.with_bandwidth(bw);
+            }
+
+            if let Some(s) = socket_buf {
+                config = config.with_socket_buf(parse_byte_size(&s)?);
             }
 
             use rperf3::client::Client;

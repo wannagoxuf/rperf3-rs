@@ -89,7 +89,7 @@ fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
 /// Expected 10-20% improvement in UDP throughput tests with reduced packet loss.
 fn configure_udp_socket(socket: &UdpSocket) -> Result<()> {
     // Set larger send and receive buffers for UDP
-    const BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB
+    const BUFFER_SIZE: usize = 32 * 1024 * 1024; // 32MB for high-throughput multi-stream
     let sock_ref = SockRef::from(socket);
 
     sock_ref.set_send_buffer_size(BUFFER_SIZE).map_err(|e| {

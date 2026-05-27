@@ -180,6 +180,9 @@ pub struct Config {
 
     /// Expected packets per second for one-way mode (for packet loss calculation)
     pub expected_pps: Option<u64>,
+
+    /// Socket buffer size in bytes (0 = use default)
+    pub socket_buf: usize,
 }
 
 impl Default for Config {
@@ -199,6 +202,7 @@ impl Default for Config {
             interval: Duration::from_secs(1),
             one_way: OneWayMode::None,
             expected_pps: None,
+            socket_buf: 0,
         }
     }
 }
@@ -509,9 +513,24 @@ impl Config {
         self.expected_pps = Some(pps);
         self
     }
-}
 
-#[cfg(test)]
+    /// Sets the socket buffer size for UDP send/receive.
+    ///
+    /// If set to 0 (default), uses the built-in default (32MB for high-throughput UDP).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rperf3::Config;
+    ///
+    /// let config = Config::new()
+    ///     .with_socket_buf(64 * 1024 * 1024); // 64MB
+    /// ```
+    pub fn with_socket_buf(mut self, size: usize) -> Self {
+        self.socket_buf = size;
+        self
+    }
+}
 mod tests {
     use super::*;
 

@@ -73,12 +73,13 @@ fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
 /// Configure UDP socket options for optimal performance.
 ///
 /// This function applies the following optimizations:
-/// - **Send buffer**: Increases to 2MB for better burst handling
-/// - **Receive buffer**: Increases to 2MB to reduce packet loss
+/// - **Send buffer**: Set to `buf_size` (or 32MB default) for better burst handling
+/// - **Receive buffer**: Set to `buf_size` (or 32MB default) to reduce packet loss
 ///
 /// # Arguments
 ///
 /// * `socket` - The UDP socket to configure
+/// * `buf_size` - Buffer size in bytes (0 = use 32MB default)
 ///
 /// # Returns
 ///
@@ -87,19 +88,19 @@ fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
 /// # Performance Impact
 ///
 /// Expected 10-20% improvement in UDP throughput tests with reduced packet loss.
-fn configure_udp_socket(socket: &UdpSocket) -> Result<()> {
-    // Set larger send and receive buffers for UDP
-    const BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB
+pub fn configure_udp_socket(socket: &UdpSocket, buf_size: usize) -> Result<()> {
+    // Default 32MB for high-throughput multi-stream, or use user-specified size
+    let bufsz = if buf_size == 0 { 32 * 1024 * 1024 } else { buf_size };
     let sock_ref = SockRef::from(socket);
 
-    sock_ref.set_send_buffer_size(BUFFER_SIZE).map_err(|e| {
+    sock_ref.set_send_buffer_size(bufsz).map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
             format!("Failed to set UDP send buffer size: {}", e),
         ))
     })?;
 
-    sock_ref.set_recv_buffer_size(BUFFER_SIZE).map_err(|e| {
+    sock_ref.set_recv_buffer_size(bufsz).map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
             format!("Failed to set UDP recv buffer size: {}", e),
@@ -108,7 +109,7 @@ fn configure_udp_socket(socket: &UdpSocket) -> Result<()> {
 
     debug!(
         "UDP socket configured: buffers={}MB",
-        BUFFER_SIZE / (1024 * 1024)
+        bufsz / (1024 * 1024)
     );
 
     Ok(())
@@ -338,7 +339,7 @@ impl Server {
         let local_addr = socket.local_addr()?;
 
         // Configure UDP socket for optimal performance
-        configure_udp_socket(&socket)?;
+        configure_udp_socket(&socket, self.config.socket_buf)?;
 
         info!("UDP server listening on {}", local_addr);
 
@@ -802,7 +803,7 @@ async fn handle_udp_test(
         info!("handle_udp_test: one_way=Send, binding UDP port {}", config.port);
         let bind_addr = format!("0.0.0.0:{}", config.port);
         let socket = UdpSocket::bind(&bind_addr).await?;
-        configure_udp_socket(&socket)?;
+        configure_udp_socket(&socket, config.socket_buf)?;
 
         // Single socket receives from all parallel client streams (they all send to same port)
         let stats = recv_one_way_server(
@@ -882,7 +883,7 @@ async fn send_udp_data(
     let socket = UdpSocket::bind(&bind_addr).await?;
 
     // Configure UDP socket for optimal performance
-    configure_udp_socket(&socket)?;
+    configure_udp_socket(&socket, config.socket_buf)?;
 
     info!("UDP server listening on port {}", config.port);
 
@@ -1020,7 +1021,7 @@ async fn receive_udp_data(
     let socket = UdpSocket::bind(&bind_addr).await?;
 
     // Configure UDP socket for optimal performance
-    configure_udp_socket(&socket)?;
+    configure_udp_socket(&socket, config.socket_buf)?;
 
     info!("UDP server listening for packets on port {}", config.port);
 
