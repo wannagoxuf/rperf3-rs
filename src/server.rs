@@ -1539,8 +1539,10 @@ async fn recv_one_way_receiver(
                 bytes_received.fetch_add(n as u64, Ordering::SeqCst);
                 packets_received.fetch_add(1, Ordering::SeqCst);
 
-                if n >= 4 {
+                if n >= 8 {
+                    // Client writes: bytes[0..4]=sequence, bytes[4..8]=stream_id
                     let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let _stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
                     // Initialize lowest seen seq on first packet
                     if seq > expected_seq {
@@ -1649,10 +1651,10 @@ async fn recv_one_way_server_with_socket(
                 packets_received += 1;
 
                 // Parse sequence number for loss/out-of-order detection
-                if n >= 4 {
-                    // Parse stream_id (bytes 4-8) and sequence (bytes 8-12)
+                if n >= 8 {
+                    // Client writes: bytes[0..4]=sequence, bytes[4..8]=stream_id
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                    let seq = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
 
                     // Get or create per-stream state
                     let stream_state = stream_states

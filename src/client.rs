@@ -879,7 +879,7 @@ impl Client {
                         let local_addr = format!("0.0.0.0:{}", local_port);
                         let sock = UdpSocket::bind(&local_addr).await?;
                         let mut buf = vec![0u8; bs];
-                        let stats = send_one_way_with_offset(&sock, server_addr, dur, bw, &mut buf, seq_offset as u32).await?;
+                        let stats = send_one_way_with_offset(&sock, server_addr, dur, bw, &mut buf, seq_offset as u32, stream_id as u32).await?;
                         Ok::<_, anyhow::Error>(stats)
                     });
                     handles.push(handle);
@@ -1919,6 +1919,8 @@ pub async fn send_one_way(
     while start.elapsed() < duration {
         // Write sequence number into first 4 bytes of packet
         buffer[0..4].copy_from_slice(&seq.to_be_bytes());
+        // Write stream_id to bytes 4-8 (matches server expectation for multi-stream)
+        buffer[4..8].copy_from_slice(&0u32.to_be_bytes());
         seq = seq.wrapping_add(1);
 
         match socket.send_to(buffer, addr).await {
@@ -1954,6 +1956,7 @@ pub async fn send_one_way_with_offset(
     bandwidth: Option<u64>,
     buffer: &mut [u8],
     seq_offset: u32,
+    stream_id: u32,
 ) -> Result<OneWaySendStats> {
     let start = Instant::now();
     let mut bytes_sent: u64 = 0;
@@ -1964,6 +1967,8 @@ pub async fn send_one_way_with_offset(
     while start.elapsed() < duration {
         // Write sequence number into first 4 bytes of packet (u32, big-endian)
         buffer[0..4].copy_from_slice(&seq.to_be_bytes());
+        // Write stream_id to bytes 4-8 (identifies which parallel stream this packet belongs to)
+        buffer[4..8].copy_from_slice(&stream_id.to_be_bytes());
         seq = seq.wrapping_add(1);
 
         match socket.send_to(buffer, addr).await {
