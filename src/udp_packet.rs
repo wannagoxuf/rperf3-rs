@@ -106,27 +106,35 @@ const RPERF3_UDP_MAGIC: u32 = 0x52504633; // "RPF3" in ASCII
 /// This header is prepended to UDP payload to enable packet loss and jitter measurement.
 /// The format is:
 /// ```text
-/// | Magic (4 bytes) | Sequence (8 bytes) | Timestamp (8 bytes) | Payload (variable) |
+/// | Magic (4 bytes) | StreamID (4 bytes) | Sequence (4 bytes) | Timestamp (8 bytes) |
 /// ```
+///
+/// **StreamID** identifies which parallel stream the packet belongs to (0 = default).
+/// **Sequence** is per-stream, starting from 0 for each stream.
+/// With parallel streams, each stream uses `stream_id * 0xFFFFFFFF` as its sequence offset
+/// so that sequence numbers from different streams don't overlap.
 #[derive(Debug, Clone, Copy)]
 pub struct UdpPacketHeader {
     /// Magic marker to identify rperf3 packets
     pub magic: u32,
-    /// Packet sequence number (monotonically increasing)
-    pub sequence: u64,
+    /// Stream identifier (0 = single stream, 1-255 = parallel stream index)
+    pub stream_id: u32,
+    /// Packet sequence number within this stream (monotonically increasing)
+    pub sequence: u32,
     /// Send timestamp in microseconds since UNIX epoch
     pub timestamp_us: u64,
 }
 
 impl UdpPacketHeader {
     /// Size of the header in bytes
-    pub const SIZE: usize = 20; // 4 (magic) + 8 (sequence) + 8 (timestamp)
+    pub const SIZE: usize = 20; // 4 (magic) + 4 (stream_id) + 4 (sequence) + 8 (timestamp)
 
     /// Creates a new UDP packet header
     ///
     /// # Arguments
     ///
-    /// * `sequence` - Packet sequence number
+    /// * `stream_id` - Stream identifier (0 = single stream, 1-255 = parallel stream)
+    /// * `sequence` - Packet sequence number within this stream
     /// * `timestamp_us` - Send timestamp in microseconds
     ///
     /// # Examples
@@ -134,13 +142,15 @@ impl UdpPacketHeader {
     /// ```
     /// use rperf3::udp_packet::UdpPacketHeader;
     ///
-    /// let header = UdpPacketHeader::new(42, 1234567890);
+    /// let header = UdpPacketHeader::new(0, 42, 1234567890);
+    /// assert_eq!(header.stream_id, 0);
     /// assert_eq!(header.sequence, 42);
     /// assert_eq!(header.timestamp_us, 1234567890);
     /// ```
-    pub fn new(sequence: u64, timestamp_us: u64) -> Self {
+    pub fn new(stream_id: u32, sequence: u32, timestamp_us: u64) -> Self {
         Self {
             magic: RPERF3_UDP_MAGIC,
+            stream_id,
             sequence,
             timestamp_us,
         }
@@ -150,6 +160,7 @@ impl UdpPacketHeader {
     ///
     /// # Arguments
     ///
+    /// * `stream_id` - Stream identifier
     /// * `sequence` - Packet sequence number
     ///
     /// # Examples
@@ -157,17 +168,18 @@ impl UdpPacketHeader {
     /// ```
     /// use rperf3::udp_packet::UdpPacketHeader;
     ///
-    /// let header = UdpPacketHeader::with_current_time(100);
+    /// let header = UdpPacketHeader::with_current_time(0, 100);
+    /// assert_eq!(header.stream_id, 0);
     /// assert_eq!(header.sequence, 100);
     /// // Timestamp should be recent (within last 10 seconds)
     /// assert!(header.timestamp_us > 0);
     /// ```
-    pub fn with_current_time(sequence: u64) -> Self {
+    pub fn with_current_time(stream_id: u32, sequence: u32) -> Self {
         let timestamp_us = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_micros() as u64;
-        Self::new(sequence, timestamp_us)
+        Self::new(stream_id, sequence, timestamp_us)
     }
 
     /// Serializes the header to bytes (big-endian)
@@ -181,19 +193,21 @@ impl UdpPacketHeader {
     /// ```
     /// use rperf3::udp_packet::UdpPacketHeader;
     ///
-    /// let header = UdpPacketHeader::new(42, 1234567890);
+    /// let header = UdpPacketHeader::new(0, 42, 1234567890);
     /// let bytes = header.to_bytes();
     /// assert_eq!(bytes.len(), 20);
     ///
     /// // Verify round-trip serialization
     /// let parsed = UdpPacketHeader::from_bytes(&bytes).unwrap();
+    /// assert_eq!(parsed.stream_id, 0);
     /// assert_eq!(parsed.sequence, 42);
     /// assert_eq!(parsed.timestamp_us, 1234567890);
     /// ```
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..4].copy_from_slice(&self.magic.to_be_bytes());
-        bytes[4..12].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[4..8].copy_from_slice(&self.stream_id.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.sequence.to_be_bytes());
         bytes[12..20].copy_from_slice(&self.timestamp_us.to_be_bytes());
         bytes
     }
@@ -213,11 +227,12 @@ impl UdpPacketHeader {
     /// ```
     /// use rperf3::udp_packet::UdpPacketHeader;
     ///
-    /// let header = UdpPacketHeader::new(100, 9876543210);
+    /// let header = UdpPacketHeader::new(1, 100, 9876543210);
     /// let bytes = header.to_bytes();
     ///
     /// // Parse valid header
     /// let parsed = UdpPacketHeader::from_bytes(&bytes).unwrap();
+    /// assert_eq!(parsed.stream_id, 1);
     /// assert_eq!(parsed.sequence, 100);
     /// assert_eq!(parsed.timestamp_us, 9876543210);
     ///
@@ -239,11 +254,13 @@ impl UdpPacketHeader {
             return None;
         }
 
-        let sequence = u64::from_be_bytes(bytes[4..12].try_into().ok()?);
+        let stream_id = u32::from_be_bytes(bytes[4..8].try_into().ok()?);
+        let sequence = u32::from_be_bytes(bytes[8..12].try_into().ok()?);
         let timestamp_us = u64::from_be_bytes(bytes[12..20].try_into().ok()?);
 
         Some(Self {
             magic,
+            stream_id,
             sequence,
             timestamp_us,
         })
@@ -257,28 +274,29 @@ impl UdpPacketHeader {
 ///
 /// # Arguments
 ///
-/// * `sequence` - Packet sequence number (should be monotonically increasing)
-/// * `payload_size` - Size of payload in bytes (excluding 20-byte header)
+/// Creates a UDP packet with header and payload.
 ///
-/// # Returns
+/// Constructs a complete UDP packet with the current timestamp and zero-filled payload.
+/// The packet format is: `[header (20 bytes)][payload (payload_size bytes)]`.
 ///
-/// A vector containing the complete packet (header + payload)
+/// # Arguments
 ///
-/// # Examples
+/// * `stream_id` - Stream identifier (0 = single stream, 1-255 = parallel stream)
+/// * `sequence` - Packet sequence number within this stream (should be monotonically increasing)
 ///
 /// ```
 /// use rperf3::udp_packet::create_packet;
 ///
-/// // Create a packet with sequence 0 and 1024 bytes of data
-/// let packet = create_packet(0, 1024);
+/// // Create a packet with stream_id=1, sequence=0 and 1024 bytes of data
+/// let packet = create_packet(1, 0, 1024);
 /// assert_eq!(packet.len(), 20 + 1024); // header + payload
 /// ```
 ///
 /// # Returns
 ///
 /// Vector containing serialized header followed by zero-filled payload
-pub fn create_packet(sequence: u64, payload_size: usize) -> Vec<u8> {
-    let header = UdpPacketHeader::with_current_time(sequence);
+pub fn create_packet(stream_id: u32, sequence: u32, payload_size: usize) -> Vec<u8> {
+    let header = UdpPacketHeader::with_current_time(stream_id, sequence);
     let mut packet = Vec::with_capacity(UdpPacketHeader::SIZE + payload_size);
     packet.extend_from_slice(&header.to_bytes());
     packet.resize(UdpPacketHeader::SIZE + payload_size, 0);
@@ -297,7 +315,8 @@ pub fn create_packet(sequence: u64, payload_size: usize) -> Vec<u8> {
 ///
 /// # Arguments
 ///
-/// * `sequence` - Packet sequence number (should be monotonically increasing)
+/// * `stream_id` - Stream identifier (0 = single stream, 1-255 = parallel stream)
+/// * `sequence` - Packet sequence number within this stream (should be monotonically increasing)
 /// * `payload_size` - Size of payload in bytes (excluding 20-byte header)
 ///
 /// # Returns
@@ -316,7 +335,7 @@ pub fn create_packet(sequence: u64, payload_size: usize) -> Vec<u8> {
 ///
 /// // Create packets in a high-performance loop
 /// for seq in 0..100 {
-///     let packet = create_packet_fast(seq, 1024);
+///     let packet = create_packet_fast(0, seq, 1024);
 ///     assert_eq!(packet.len(), 20 + 1024);
 ///     
 ///     // Verify packet is valid
@@ -332,8 +351,8 @@ pub fn create_packet(sequence: u64, payload_size: usize) -> Vec<u8> {
 /// use rperf3::udp_packet::{create_packet, create_packet_fast, parse_packet};
 ///
 /// // Both functions produce valid packets with the same format
-/// let packet1 = create_packet(1, 1000);
-/// let packet2 = create_packet_fast(1, 1000);
+/// let packet1 = create_packet(1, 0, 1000);
+/// let packet2 = create_packet_fast(1, 0, 1000);
 ///
 /// assert_eq!(packet1.len(), packet2.len());
 ///
@@ -342,12 +361,13 @@ pub fn create_packet(sequence: u64, payload_size: usize) -> Vec<u8> {
 /// let (header2, _) = parse_packet(&packet2).unwrap();
 ///
 /// assert_eq!(header1.sequence, header2.sequence);
+/// assert_eq!(header1.stream_id, header2.stream_id);
 /// // Timestamps may differ slightly due to caching
 /// ```
-pub fn create_packet_fast(sequence: u64, payload_size: usize) -> Vec<u8> {
+pub fn create_packet_fast(stream_id: u32, sequence: u32, payload_size: usize) -> Vec<u8> {
     let timestamp_us = TIMESTAMP_CACHE.with(|cache| cache.borrow_mut().get_timestamp());
 
-    let header = UdpPacketHeader::new(sequence, timestamp_us);
+    let header = UdpPacketHeader::new(stream_id, sequence, timestamp_us);
     let mut packet = Vec::with_capacity(UdpPacketHeader::SIZE + payload_size);
     packet.extend_from_slice(&header.to_bytes());
     packet.resize(UdpPacketHeader::SIZE + payload_size, 0);
@@ -370,9 +390,10 @@ pub fn create_packet_fast(sequence: u64, payload_size: usize) -> Vec<u8> {
 /// use rperf3::udp_packet::{create_packet, parse_packet};
 ///
 /// // Create and parse a packet
-/// let packet = create_packet(123, 512);
+/// let packet = create_packet(1, 123, 512);
 /// let (header, payload) = parse_packet(&packet).expect("Valid packet");
 ///
+/// assert_eq!(header.stream_id, 1);
 /// assert_eq!(header.sequence, 123);
 /// assert_eq!(payload.len(), 512);
 /// assert!(header.timestamp_us > 0);

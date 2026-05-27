@@ -6,12 +6,15 @@ use crate::protocol::{deserialize_message, serialize_message, Message, DEFAULT_S
 use crate::{Error, Result};
 use log::{debug, error, info};
 use socket2::SockRef;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// Configure TCP socket options for optimal performance.
@@ -385,7 +388,7 @@ impl Server {
 
                         // Record packet with timing information
                         self.measurements.record_udp_packet_received(
-                            header.sequence,
+                            header.sequence as u64,
                             header.timestamp_us,
                             recv_timestamp_us,
                         );
@@ -518,7 +521,7 @@ impl Server {
 
                                 // Record packet with timing information
                                 self.measurements.record_udp_packet_received(
-                                    header.sequence,
+                                    header.sequence as u64,
                                     header.timestamp_us,
                                     recv_timestamp_us,
                                 );
@@ -801,6 +804,7 @@ async fn handle_udp_test(
         let socket = UdpSocket::bind(&bind_addr).await?;
         configure_udp_socket(&socket)?;
 
+        // Single socket receives from all parallel client streams (they all send to same port)
         let stats = recv_one_way_server(
             &socket,
             duration,
@@ -808,9 +812,15 @@ async fn handle_udp_test(
             config.buffer_size,
         )
         .await?;
-        info!("recv_one_way_server returned: bytes={}, packets={}", 
+        info!("recv_one_way_server returned: bytes={}, packets={}",
               stats.bytes_received, stats.packets_received);
-        println!("One-way send mode stats: bytes={}, packets={}, out_of_order={}, lost={}, loss={:.2}%",
+        let stream_info = if config.parallel > 1 {
+            format!(" ({} streams)", config.parallel)
+        } else {
+            String::new()
+        };
+        println!("One-way send mode stats{}: bytes={}, packets={}, out_of_order={}, lost={}, loss={:.2}%",
+            stream_info,
             stats.bytes_received, stats.packets_received, stats.out_of_order, stats.packets_lost, stats.packet_loss.unwrap_or(0.0));
     } else if config.one_way == OneWayMode::Receive {
         // One-way receive mode: server sends, client receives only
@@ -889,7 +899,7 @@ async fn send_udp_data(
     let mut last_interval = start;
     let mut interval_bytes = 0u64;
     let mut interval_packets = 0u64;
-    let mut sequence = 0u64;
+    let mut sequence = 0u32;
 
     // Calculate payload size accounting for UDP packet header
     let payload_size = if buffer_size > crate::udp_packet::UdpPacketHeader::SIZE {
@@ -904,7 +914,7 @@ async fn send_udp_data(
     let mut last_bandwidth_check = start;
 
     while start.elapsed() < duration {
-        let packet = crate::udp_packet::create_packet_fast(sequence, payload_size);
+        let packet = crate::udp_packet::create_packet_fast(0, sequence, payload_size);
 
         match socket.send(&packet).await {
             Ok(n) => {
@@ -1037,7 +1047,7 @@ async fn receive_udp_data(
 
                     measurements.record_bytes_received(0, n as u64);
                     measurements.record_udp_packet_received(
-                        header.sequence,
+                        header.sequence as u64,
                         header.timestamp_us,
                         recv_timestamp_us,
                     );
@@ -1363,7 +1373,218 @@ pub async fn recv_one_way_server(
     _expected_pps: Option<u64>,
     buffer_size: usize,
 ) -> Result<ServerOneWayStats> {
-    
+    recv_one_way_server_with_socket(socket, duration, buffer_size).await
+}
+
+/// Internal version that takes an extra port parameter for multi-stream reception.
+pub async fn recv_one_way_server_multi(
+    socket: &UdpSocket,
+    duration: Duration,
+    buffer_size: usize,
+    extra_ports: &[u16],
+    port: u16,
+) -> Result<ServerOneWayStats> {
+    let start = Instant::now();
+    let test_end = start + duration;
+
+    info!("recv_one_way_server_multi: starting, duration={:?}, buffer_size={}, extra_ports={:?}",
+          duration, buffer_size, extra_ports);
+
+    // Track stats with atomics for safe concurrent access
+    let bytes_received = Arc::new(AtomicU64::new(0));
+    let packets_received = Arc::new(AtomicU64::new(0));
+    let out_of_order = Arc::new(AtomicU64::new(0));
+    let packets_lost = Arc::new(AtomicU64::new(0));
+
+    // Shared buffer for all receivers
+    let buffer_size_clone = buffer_size;
+
+    // Spawn a receiver task for each port (main socket + extra ports)
+    let mut handles = Vec::new();
+
+    /// Helper to build receiver closure with its OWN expected_seq (not shared across ports)
+        let make_receiver = |sock: UdpSocket, port: u16| {
+            let bytes_rx = bytes_received.clone();
+            let packets_rx = packets_received.clone();
+            let ooo = out_of_order.clone();
+            let lost = packets_lost.clone();
+            let bs = buffer_size_clone;
+            let end = test_end;
+
+            tokio::spawn(async move {
+                recv_one_way_receiver(&sock, end, bs, bytes_rx, packets_rx, ooo, lost).await
+            })
+        };
+
+    // Main socket receiver — rebind to same port (os will reuse due to SO_REUSEPORT or close first)
+    let main_port = port;
+    drop(socket); // release reference so we can rebind
+    let main_addr = format!("0.0.0.0:{}", main_port);
+    let main_socket = UdpSocket::bind(&main_addr).await?;
+    handles.push(make_receiver(main_socket, main_port));
+
+    // Extra port receivers
+    for &port in extra_ports {
+        let local_addr = format!("0.0.0.0:{}", port);
+        match UdpSocket::bind(&local_addr).await {
+            Ok(sock) => {
+                handles.push(make_receiver(sock, port));
+            }
+            Err(e) => {
+                error!("Failed to bind extra port {}: {}", port, e);
+            }
+        }
+    }
+
+    // Wait for all receivers to complete
+    let mut join_set = JoinSet::new();
+    for (i, handle) in handles.into_iter().enumerate() {
+        join_set.spawn(async move { (i, handle.await) });
+    }
+    let mut total_bytes: u64 = 0;
+    let mut total_packets: u64 = 0;
+    let mut total_lost: u64 = 0;
+    let mut total_ooo: u64 = 0;
+    let mut first_err: Option<String> = None;
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((i, Ok(_stats))) => {
+                // Each stream's stats are accumulated in the atomic counters
+            }
+            Ok((i, Err(e))) => {
+                let msg = format!("Receiver {} error: {}", i, e);
+                error!("{}", msg);
+                if first_err.is_none() { first_err = Some(msg); }
+            }
+            Err(e) => {
+                let msg = format!("Receiver panicked: {:?}", e);
+                error!("{}", msg);
+                if first_err.is_none() { first_err = Some(msg); }
+            }
+        }
+    }
+
+    // Read final totals from atomic counters
+    total_bytes = bytes_received.load(Ordering::SeqCst);
+    total_packets = packets_received.load(Ordering::SeqCst);
+    total_lost = packets_lost.load(Ordering::SeqCst);
+    total_ooo = out_of_order.load(Ordering::SeqCst);
+
+    let total_sent = total_packets + total_lost;
+    let packet_loss = if total_sent > 0 {
+        Some((total_lost as f64 / total_sent as f64) * 100.0)
+    } else {
+        None
+    };
+
+    let final_rate_gbps = if start.elapsed().as_secs_f64() > 0.0 {
+        (total_bytes as f64 * 8.0) / (start.elapsed().as_secs_f64() * 1e9)
+    } else {
+        0.0
+    };
+    let loss_str = match packet_loss {
+        Some(loss) => format!(", lost={}, loss={:.2}%", total_lost, loss),
+        None => String::new(),
+    };
+    println!(
+        "[{:.1}s] recv rate: {:.3} Gbps, total packets={}, bytes={}, out_of_order={}{}",
+        start.elapsed().as_secs_f64(),
+        final_rate_gbps,
+        total_packets,
+        total_bytes,
+        total_ooo,
+        loss_str
+    );
+    info!("recv_one_way_server_multi finished: bytes={}, packets={}", total_bytes, total_packets);
+
+    Ok(ServerOneWayStats {
+        bytes_received: total_bytes,
+        packets_received: total_packets,
+        out_of_order: total_ooo,
+        packets_lost: total_lost,
+        packet_loss,
+        duration: start.elapsed(),
+    })
+}
+
+/// Single UDP receiver that fills stats into shared atomics.
+async fn recv_one_way_receiver(
+    socket: &UdpSocket,
+    test_end: Instant,
+    buffer_size: usize,
+    bytes_received: Arc<AtomicU64>,
+    packets_received: Arc<AtomicU64>,
+    out_of_order: Arc<AtomicU64>,
+    packets_lost: Arc<AtomicU64>,
+) {
+    let mut buf = vec![0u8; buffer_size];
+    let mut expected_seq: u32 = 0;
+
+    loop {
+        let now = Instant::now();
+        if now >= test_end {
+            break;
+        }
+        let remaining = test_end - now;
+        let timeout_duration = std::cmp::min(remaining, Duration::from_millis(100));
+
+        let recv_result = tokio::time::timeout(timeout_duration, socket.recv_from(&mut buf)).await;
+
+        if now >= test_end {
+            break;
+        }
+
+        match recv_result {
+            Ok(Ok((n, _))) => {
+                bytes_received.fetch_add(n as u64, Ordering::SeqCst);
+                packets_received.fetch_add(1, Ordering::SeqCst);
+
+                if n >= 4 {
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+
+                    // Initialize lowest seen seq on first packet
+                    if seq > expected_seq {
+                        // Gap = lost packets
+                        let gap = (seq as u64 - expected_seq as u64) as u64;
+                        packets_lost.fetch_add(gap, Ordering::SeqCst);
+                        expected_seq = seq.wrapping_add(1);
+                    } else if seq < expected_seq {
+                        // Out-of-order
+                        out_of_order.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        expected_seq = expected_seq.wrapping_add(1);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                error!("Receive error on socket: {}", e);
+            }
+            Err(_) => {
+                // Timeout — just loop
+            }
+        }
+    }
+}
+
+/// Per-stream state for tracking sequence numbers in multi-stream mode.
+struct StreamState {
+    expected_seq: u32,
+}
+
+impl StreamState {
+    fn new(initial_seq: u32) -> Self {
+        Self {
+            expected_seq: initial_seq,
+        }
+    }
+}
+
+/// Internal single-socket receiver (refactored out for clarity).
+async fn recv_one_way_server_with_socket(
+    socket: &UdpSocket,
+    duration: Duration,
+    buffer_size: usize,
+) -> Result<ServerOneWayStats> {
     let start = Instant::now();
     let test_end = start + duration;
     info!("recv_one_way_server: starting, duration={:?}, buffer_size={}", duration, buffer_size);
@@ -1371,7 +1592,9 @@ pub async fn recv_one_way_server(
     let mut packets_received: u64 = 0;
     let mut out_of_order: u64 = 0;
     let mut packets_lost: u64 = 0;
-    let mut expected_seq: u32 = 0;
+
+    // Per-stream state for sequence tracking (supports multiple parallel streams)
+    let mut stream_states: HashMap<u32, StreamState> = HashMap::new();
 
     // Per-interval tracking for rate calculation
     let mut interval_bytes: u64 = 0;
@@ -1427,19 +1650,24 @@ pub async fn recv_one_way_server(
 
                 // Parse sequence number for loss/out-of-order detection
                 if n >= 4 {
-                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                    if expected_seq == 0 {
-                        expected_seq = seq;
-                    }
-                    if seq > expected_seq {
+                    // Parse stream_id (bytes 4-8) and sequence (bytes 8-12)
+                    let stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    let seq = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+                    // Get or create per-stream state
+                    let stream_state = stream_states
+                        .entry(stream_id)
+                        .or_insert_with(|| StreamState::new(seq));
+
+                    if seq > stream_state.expected_seq {
                         // Gap detected: packets were lost
-                        packets_lost += (seq - expected_seq) as u64;
-                        expected_seq = seq.wrapping_add(1);
-                    } else if seq < expected_seq {
-                        // Out-of-order: received a sequence we've seen before or a late packet
+                        packets_lost += (seq - stream_state.expected_seq) as u64;
+                        stream_state.expected_seq = seq.wrapping_add(1);
+                    } else if seq < stream_state.expected_seq {
+                        // Out-of-order or late packet
                         out_of_order += 1;
                     } else {
-                        expected_seq = expected_seq.wrapping_add(1);
+                        stream_state.expected_seq = stream_state.expected_seq.wrapping_add(1);
                     }
                 }
             }

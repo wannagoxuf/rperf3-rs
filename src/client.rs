@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// Configure TCP socket options for optimal performance.
@@ -836,17 +837,80 @@ impl Client {
 
         let result = if self.config.one_way == OneWayMode::Send {
             // One-way send mode: client sends, server receives only
-            let mut buffer = vec![0u8; self.config.buffer_size];
-            let stats = send_one_way(
-                &socket,
-                socket.peer_addr()?,
-                self.config.duration,
-                self.config.bandwidth,
-                &mut buffer,
-            )
-            .await?;
-            println!("One-way send stats: bytes={}, packets={}, duration={:?}",
-                stats.bytes_sent, stats.packets_sent, stats.duration);
+            // Support parallel streams for higher throughput
+            let num_streams = self.config.parallel;
+            let duration = self.config.duration;
+            let bandwidth = self.config.bandwidth;
+            let buffer_size = self.config.buffer_size;
+            let server_addr = socket.peer_addr()?;
+
+            if num_streams <= 1 {
+                // Single stream — same as before
+                let mut buffer = vec![0u8; buffer_size];
+                let stats = send_one_way(
+                    &socket,
+                    server_addr,
+                    duration,
+                    bandwidth,
+                    &mut buffer,
+                )
+                .await?;
+                println!("One-way send stats: bytes={}, packets={}, duration={:?}",
+                    stats.bytes_sent, stats.packets_sent, stats.duration);
+            } else {
+                // Multiple streams — spawn N independent tasks, each with its own socket
+                println!("Starting {} parallel one-way send streams...", num_streams);
+                let mut handles = Vec::new();
+                for stream_id in 0..num_streams {
+                    let dur = duration;
+                    let bw = bandwidth;
+                    let bs = buffer_size;
+                    // Stagger sequence space per stream to avoid sequence conflicts at receiver
+                    let seq_offset = (stream_id as u64) * 10_000_000;
+
+                    let handle = tokio::spawn(async move {
+                        // All streams send to the same server port (5201)
+                        // Each stream uses a different local port to avoid conflicts
+                        let local_port = if stream_id == 0 {
+                            0 // OS assigns random port for first stream
+                        } else {
+                            5201 + stream_id as u16
+                        };
+                        let local_addr = format!("0.0.0.0:{}", local_port);
+                        let sock = UdpSocket::bind(&local_addr).await?;
+                        let mut buf = vec![0u8; bs];
+                        let stats = send_one_way_with_offset(&sock, server_addr, dur, bw, &mut buf, seq_offset as u32).await?;
+                        Ok::<_, anyhow::Error>(stats)
+                    });
+                    handles.push(handle);
+                }
+
+                let mut join_set = JoinSet::new();
+                for (i, handle) in handles.into_iter().enumerate() {
+                    join_set.spawn(async move { (i, handle.await) });
+                }
+                let mut total_bytes: u64 = 0;
+                let mut total_packets: u64 = 0;
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok((i, Ok(Ok(stats)))) => {
+                            total_bytes += stats.bytes_sent;
+                            total_packets += stats.packets_sent;
+                        }
+                        Ok((i, Ok(Err(e)))) => {
+                            eprintln!("Stream {} error: {}", i, e);
+                        }
+                        Ok((_, Err(e))) => {
+                            eprintln!("Join error: {:?}", e);
+                        }
+                        Err(e) => {
+                            eprintln!("Stream panicked: {:?}", e);
+                        }
+                    }
+                }
+                println!("One-way send stats: bytes={}, packets={}, streams={}",
+                    total_bytes, total_packets, num_streams);
+            }
             Ok(())
         } else if self.config.one_way == OneWayMode::Receive {
             // One-way receive mode: server sends, client receives only
@@ -862,7 +926,7 @@ impl Client {
             Ok(())
         } else if self.config.reverse {
             // Reverse mode: Send one initialization packet to let server know our UDP port
-            let init_packet = crate::udp_packet::create_packet(0, 0);
+            let init_packet = crate::udp_packet::create_packet(0, 0, 0);
             socket.send(&init_packet).await?;
 
             // Receive data from server
@@ -924,7 +988,7 @@ impl Client {
                 break;
             }
 
-            let packet = crate::udp_packet::create_packet_fast(sequence, payload_size);
+            let packet = crate::udp_packet::create_packet_fast(0, sequence as u32, payload_size);
 
             match socket.send(&packet).await {
                 Ok(n) => {
@@ -1118,7 +1182,7 @@ impl Client {
                 && batch.len() < adaptive_batch_size
                 && start.elapsed() < self.config.duration
             {
-                let packet = crate::udp_packet::create_packet_fast(sequence, payload_size);
+                let packet = crate::udp_packet::create_packet_fast(0, sequence as u32, payload_size);
                 batch.add(packet, remote_addr);
                 sequence += 1;
             }
@@ -1291,7 +1355,7 @@ impl Client {
                             .as_micros() as u64;
 
                         self.measurements.record_udp_packet_received(
-                            header.sequence,
+                            header.sequence as u64,
                             header.timestamp_us,
                             recv_timestamp_us,
                         );
@@ -1854,6 +1918,51 @@ pub async fn send_one_way(
 
     while start.elapsed() < duration {
         // Write sequence number into first 4 bytes of packet
+        buffer[0..4].copy_from_slice(&seq.to_be_bytes());
+        seq = seq.wrapping_add(1);
+
+        match socket.send_to(buffer, addr).await {
+            Ok(n) => {
+                bytes_sent += n as u64;
+                packets_sent += 1;
+            }
+            Err(e) => {
+                error!("Send error: {}", e);
+                return Err(Error::Io(e));
+            }
+        }
+
+        // Rate limiting
+        if let Some(ref mut tb) = token_bucket {
+            tb.consume(buffer.len()).await;
+        }
+    }
+
+    Ok(OneWaySendStats {
+        bytes_sent,
+        packets_sent,
+        duration: start.elapsed(),
+    })
+}
+
+/// One-way send with a sequence offset (for parallel streams).
+/// Each parallel stream uses a different offset so sequence numbers don't conflict.
+pub async fn send_one_way_with_offset(
+    socket: &UdpSocket,
+    addr: std::net::SocketAddr,
+    duration: Duration,
+    bandwidth: Option<u64>,
+    buffer: &mut [u8],
+    seq_offset: u32,
+) -> Result<OneWaySendStats> {
+    let start = Instant::now();
+    let mut bytes_sent: u64 = 0;
+    let mut packets_sent: u64 = 0;
+    let mut seq: u32 = seq_offset;
+    let mut token_bucket = bandwidth.map(|bw| crate::token_bucket::TokenBucket::new(bw / 8));
+
+    while start.elapsed() < duration {
+        // Write sequence number into first 4 bytes of packet (u32, big-endian)
         buffer[0..4].copy_from_slice(&seq.to_be_bytes());
         seq = seq.wrapping_add(1);
 
