@@ -796,7 +796,7 @@ async fn handle_udp_test(
 
     if config.one_way == OneWayMode::Send {
         // One-way send mode: client sends, server receives only
-        // Bind to UDP port and wait for client packets
+        info!("handle_udp_test: one_way=Send, binding UDP port {}", config.port);
         let bind_addr = format!("0.0.0.0:{}", config.port);
         let socket = UdpSocket::bind(&bind_addr).await?;
         configure_udp_socket(&socket)?;
@@ -808,6 +808,8 @@ async fn handle_udp_test(
             config.buffer_size,
         )
         .await?;
+        info!("recv_one_way_server returned: bytes={}, packets={}", 
+              stats.bytes_received, stats.packets_received);
         println!("One-way send mode stats: bytes={}, packets={}, out_of_order={}, loss={:?}%",
             stats.bytes_received, stats.packets_received, stats.out_of_order, stats.packet_loss);
     } else if config.one_way == OneWayMode::Receive {
@@ -1361,21 +1363,60 @@ pub async fn recv_one_way_server(
     expected_pps: Option<u64>,
     buffer_size: usize,
 ) -> Result<ServerOneWayStats> {
+    
     let start = Instant::now();
+    let test_end = start + duration;
+    info!("recv_one_way_server: starting, duration={:?}, buffer_size={}", duration, buffer_size);
     let mut bytes_received: u64 = 0;
     let mut packets_received: u64 = 0;
     let mut out_of_order: u64 = 0;
     let mut last_seq: u32 = 0;
 
+    // Per-interval tracking for rate calculation
+    let mut interval_bytes: u64 = 0;
+    let mut interval_start = start;
+    let mut prev_interval_end = start;
+
     let mut buf = vec![0u8; buffer_size];
 
-    while start.elapsed() < duration {
-        match socket.recv_from(&mut buf).await {
-            Ok((n, _)) => {
+    loop {
+        let now = Instant::now();
+        if now >= test_end {
+            break;
+        }
+        // Sleep until test ends or next tick
+        let remaining = test_end - now;
+        let timeout_duration = std::cmp::min(remaining, Duration::from_secs(1));
+
+        let recv_result = tokio::time::timeout(timeout_duration, socket.recv_from(&mut buf)).await;
+
+        let current = Instant::now();
+
+        // Print interval stats if 1 second has passed
+        if current - prev_interval_end >= Duration::from_secs(1) {
+            let elapsed = interval_start.elapsed().as_secs_f64();
+            let rate_gbps = (interval_bytes as f64 * 8.0) / (elapsed * 1e9);
+
+            println!(
+                "[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}",
+                current.saturating_duration_since(start).as_secs_f64(),
+                rate_gbps,
+                packets_received,
+                bytes_received
+            );
+
+            interval_bytes = 0;
+            interval_start = current;
+            prev_interval_end = current;
+        }
+
+        match recv_result {
+            Ok(Ok((n, _))) => {
                 bytes_received += n as u64;
+                interval_bytes += n as u64;
                 packets_received += 1;
 
-                // Sequence number detection for out-of-order
+                // Parse sequence number for out-of-order detection
                 if n >= 4 {
                     let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     if last_seq > 0 && seq < last_seq {
@@ -1384,24 +1425,46 @@ pub async fn recv_one_way_server(
                     last_seq = seq;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Receive error: {}", e);
                 return Err(Error::Io(e));
+            }
+            Err(_) => {
+                // Timeout, no data received this second — continue to print stats next tick
             }
         }
     }
 
-    // Calculate packet loss
-    let expected_packets = expected_pps.map(|pps| pps * duration.as_secs());
-    let packet_loss = expected_packets.map(|expected| {
+    // Calculate packet loss for final summary
+    let expected_total = expected_pps.map(|pps| pps * duration.as_secs());
+    let packet_loss = expected_total.map(|expected| {
         if packets_received > expected {
-            0.0  // No loss when we received more than expected (e.g., extra retransmits)
+            0.0
         } else if expected > 0 {
             ((expected - packets_received) as f64 / expected as f64) * 100.0
         } else {
             0.0
         }
     });
+
+    // Print final summary
+    let total_elapsed = start.elapsed().as_secs_f64();
+    let final_rate_gbps = (bytes_received as f64 * 8.0) / (total_elapsed * 1e9);
+    let loss_str = match packet_loss {
+        Some(loss) => format!(", loss={:.2}%", loss),
+        None => String::new(),
+    };
+    println!(
+        "[{:.1}s] recv rate: {:.3} Gbps, total packets={}, bytes={}, out_of_order={}{}",
+        total_elapsed,
+        final_rate_gbps,
+        packets_received,
+        bytes_received,
+        out_of_order,
+        loss_str
+    );
+    info!("recv_one_way_server: finished after {:?}, bytes={}, packets={}",
+          start.elapsed(), bytes_received, packets_received);
 
     Ok(ServerOneWayStats {
         bytes_received,
