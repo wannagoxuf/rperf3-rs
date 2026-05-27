@@ -1397,13 +1397,21 @@ pub async fn recv_one_way_server(
         if current - prev_interval_end >= Duration::from_secs(1) {
             let elapsed = interval_start.elapsed().as_secs_f64();
             let rate_gbps = (interval_bytes as f64 * 8.0) / (elapsed * 1e9);
+            let total_sent = packets_received + packets_lost;
+            let loss_pct = if total_sent > 0 {
+                (packets_lost as f64 / total_sent as f64) * 100.0
+            } else {
+                0.0
+            };
 
             println!(
-                "[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}",
+                "[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}, lost={}, loss={:.2}%",
                 current.saturating_duration_since(start).as_secs_f64(),
                 rate_gbps,
                 packets_received,
-                bytes_received
+                bytes_received,
+                packets_lost,
+                loss_pct
             );
 
             interval_bytes = 0;
