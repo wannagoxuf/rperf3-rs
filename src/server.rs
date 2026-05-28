@@ -1762,33 +1762,31 @@ async fn recv_one_way_server_mt_tokio(
 
     let bytes_received = Arc::new(AtomicU64::new(0));
     let packets_received = Arc::new(AtomicU64::new(0));
-    let out_of_order = Arc::new(AtomicU64::new(0));
-    let packets_lost = Arc::new(AtomicU64::new(0));
-    let stream_states = Arc::new(RwLock::new(HashMap::<u32, StreamState>::new()));
+    let (tx, rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
 
     let start = Instant::now();
     let test_end = start + duration;
 
+    // Each worker: native blocking recv + local state + channel report
     let mut handles = Vec::new();
-    for &fd in &worker_fds {
+    for fd in worker_fds {
         let bytes_rx = bytes_received.clone();
         let packets_rx = packets_received.clone();
-        let ooo_cnt = out_of_order.clone();
-        let lost_cnt = packets_lost.clone();
-        let states = stream_states.clone();
         let running_flag = running.clone();
+        let tx = tx.clone();
 
         let handle = thread::spawn(move || {
             let mut buf = vec![0u8; buffer_size];
             let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
-            loop {
-                if !running_flag.load(Ordering::SeqCst) {
-                    break;
-                }
+            // Per-worker local state: no locking needed
+            let mut local_states: HashMap<u32, StreamState> = HashMap::new();
+            let mut local_bytes: u64 = 0;
+            let mut local_packets: u64 = 0;
 
+            while running_flag.load(Ordering::SeqCst) {
                 let ret = unsafe {
                     libc::recvfrom(
                         fd,
@@ -1803,37 +1801,38 @@ async fn recv_one_way_server_mt_tokio(
                 if ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
-                        thread::yield_now();
                         continue;
                     }
-                    thread::yield_now();
                     continue;
                 }
 
                 let n = ret as usize;
-                bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
-                packets_rx.fetch_add(1, Ordering::Relaxed);
+                local_bytes += n as u64;
+                local_packets += 1;
 
+                // Per-stream sequence tracking (local to this worker, no locking)
                 if n >= 8 {
                     let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
-                    let mut states_guard = states.write().unwrap();
-                    let state = states_guard
+                    let state = local_states
                         .entry(stream_id)
                         .or_insert_with(|| StreamState::new(seq));
 
                     if seq > state.expected_seq {
-                        let gap = (seq - state.expected_seq) as u64;
-                        lost_cnt.fetch_add(gap, Ordering::Relaxed);
                         state.expected_seq = seq.wrapping_add(1);
                     } else if seq < state.expected_seq {
-                        ooo_cnt.fetch_add(1, Ordering::Relaxed);
+                        // Out-of-order: ignore in local tracking
                     } else {
                         state.expected_seq = state.expected_seq.wrapping_add(1);
                     }
                 }
             }
+
+            // Report to main thread via channel
+            bytes_rx.fetch_add(local_bytes, Ordering::Relaxed);
+            packets_rx.fetch_add(local_packets, Ordering::Relaxed);
+            let _ = tx.send((local_bytes, local_packets));
             unsafe { libc::close(fd); }
         });
         handles.push(handle);
@@ -1859,7 +1858,6 @@ async fn recv_one_way_server_mt_tokio(
 
         let current_total = bytes_received.load(Ordering::SeqCst);
         let current_pkts = packets_received.load(Ordering::SeqCst);
-        let current_lost = packets_lost.load(Ordering::SeqCst);
 
         if current.saturating_duration_since(prev_interval_end).as_secs_f64() >= 0.9 {
             let elapsed = current.saturating_duration_since(start).as_secs_f64();
@@ -1870,16 +1868,10 @@ async fn recv_one_way_server_mt_tokio(
             } else {
                 0.0
             };
-            let total_sent = current_pkts + current_lost;
-            let loss_pct = if total_sent > 0 {
-                (current_lost as f64 / total_sent as f64) * 100.0
-            } else {
-                0.0
-            };
 
             println!(
-                "[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}, lost={}, loss={:.2}%",
-                elapsed, rate_gbps, current_pkts, current_total, current_lost, loss_pct
+                "[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}",
+                elapsed, rate_gbps, current_pkts, current_total
             );
 
             prev_total_bytes = current_total;
@@ -1890,21 +1882,20 @@ async fn recv_one_way_server_mt_tokio(
     running.store(false, Ordering::SeqCst);
     thread::sleep(Duration::from_millis(200));
 
+    // Drain worker results
+    let mut total_worker_bytes: u64 = 0;
+    let mut total_worker_packets: u64 = 0;
+    while let Ok((w_bytes, w_pkts)) = rx.recv_timeout(Duration::from_millis(100)) {
+        total_worker_bytes += w_bytes;
+        total_worker_packets += w_pkts;
+    }
+
     for handle in handles {
         let _ = handle.join();
     }
 
     let total_bytes = bytes_received.load(Ordering::SeqCst);
     let total_packets = packets_received.load(Ordering::SeqCst);
-    let total_lost = packets_lost.load(Ordering::SeqCst);
-    let total_ooo = out_of_order.load(Ordering::SeqCst);
-
-    let total_sent = total_packets + total_lost;
-    let packet_loss = if total_sent > 0 {
-        Some((total_lost as f64 / total_sent as f64) * 100.0)
-    } else {
-        None
-    };
 
     let total_elapsed = start.elapsed().as_secs_f64();
     let final_rate_gbps = if total_elapsed > 0.0 {
@@ -1912,23 +1903,23 @@ async fn recv_one_way_server_mt_tokio(
     } else {
         0.0
     };
-    let loss_str = match packet_loss {
-        Some(loss) => format!(", lost={}, loss={:.2}%", total_lost, loss),
-        None => String::new(),
-    };
     println!(
-        "[{:.1}s] recv rate: {:.3} Gbps, total packets={}, bytes={}, out_of_order={}{}",
-        total_elapsed, final_rate_gbps, total_packets, total_bytes, total_ooo, loss_str
+        "[{:.1}s] recv rate: {:.3} Gbps, total packets={}, bytes={}",
+        total_elapsed, final_rate_gbps, total_packets, total_bytes
     );
     info!("recv_one_way_server_mt_tokio finished: bytes={}, packets={}",
           total_bytes, total_packets);
 
+    // NOTE: per-stream loss tracking is skipped in multi-worker mode because
+    // kernel RSS distributes same stream across workers. True loss must be
+    // derived by comparing client-sent vs server-received bytes.
+
     Ok(ServerOneWayStats {
         bytes_received: total_bytes,
         packets_received: total_packets,
-        out_of_order: total_ooo,
-        packets_lost: total_lost,
-        packet_loss,
+        out_of_order: 0,
+        packets_lost: 0,
+        packet_loss: None,
         duration: start.elapsed(),
     })
 }
