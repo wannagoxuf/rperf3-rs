@@ -1379,9 +1379,16 @@ pub async fn recv_one_way_server(
     buffer_size: usize,
     recv_workers: usize,
 ) -> Result<ServerOneWayStats> {
-    if recv_workers > 1 {
-        recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
-    } else {
+    #[cfg(target_os = "linux")]
+    {
+        if recv_workers > 1 {
+            recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
+        } else {
+            recv_one_way_server_with_socket(socket, duration, buffer_size).await
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
         recv_one_way_server_with_socket(socket, duration, buffer_size).await
     }
 }
@@ -1736,6 +1743,7 @@ async fn recv_one_way_server_with_socket(
 
 /// Multi-threaded UDP receiver using tokio socket fd duplication.
 /// Each worker thread gets a duplicated fd of the same tokio UdpSocket.
+#[cfg(target_os = "linux")]
 async fn recv_one_way_server_mt_tokio(
     socket: &UdpSocket,
     duration: Duration,

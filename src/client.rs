@@ -2038,51 +2038,41 @@ pub async fn send_one_way_with_offset(
         let dur_nanos = dur.as_nanos() as u64;
 
         while (start.elapsed().as_nanos() as u64) < dur_nanos {
+            // Linux: batch send via sendmmsg (most efficient)
             #[cfg(target_os = "linux")]
             {
-                // Fill batch with pre-allocated buffers
                 for i in 0..BATCH {
                     (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
                     (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
                     seq = seq.wrapping_add(1);
-
                     iovecs[i].iov_base = packets[i].as_ptr() as *mut _;
                     iovecs[i].iov_len = payload_size;
                     hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
                     hdrs[i].msg_hdr.msg_iovlen = 1;
                 }
-
-                // Blocking sendmmsg (Linux only)
                 let ret = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), BATCH as u32, 0) };
                 if ret > 0 {
                     total_packets += ret as u64;
                     total_bytes += (ret as u64) * payload_size as u64;
                 } else if ret < 0 {
                     let err = std::io::Error::last_os_error();
-                    if err.kind() != std::io::ErrorKind::WouldBlock {
-                        break;
-                    }
+                    if err.kind() != std::io::ErrorKind::WouldBlock { break; }
                 }
             }
-            #[cfg(target_os = "macos")]
+            // macOS / Windows: fallback to send() loop (no sendmmsg)
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                // macOS: use send() in a loop (no sendmmsg available)
                 for i in 0..BATCH {
                     (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
                     (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
                     seq = seq.wrapping_add(1);
-
-                    let ret = unsafe {
-                        libc::send(fd, packets[i].as_ptr() as *const _, payload_size, 0)
-                    };
+                    let ret = unsafe { libc::send(fd, packets[i].as_ptr() as *const _, payload_size, 0) };
                     if ret > 0 {
                         total_packets += 1;
                         total_bytes += ret as u64;
                     } else if ret < 0 {
                         let err = std::io::Error::last_os_error();
-                        if err.kind() != std::io::ErrorKind::WouldBlock {
-                            break;
-                        }
+                        if err.kind() != std::io::ErrorKind::WouldBlock { break; }
                     }
                 }
             }
