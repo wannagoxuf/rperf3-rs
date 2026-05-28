@@ -171,7 +171,7 @@ impl UdpSendBatch {
             return Ok((0, 0));
         }
 
-        let fd = socket.as_raw_fd();
+        let fd: i32 = socket.as_raw_fd() as i32;
         let packets = &self.packets;
         let addresses = &self.addresses;
 
@@ -191,7 +191,7 @@ impl UdpSendBatch {
 /// Synchronous helper for sendmmsg (Linux only)
 #[cfg(target_os = "linux")]
 fn send_mmsg_sync(
-    fd: std::os::unix::io::RawFd,
+    fd: i32,
     packets: &[Vec<u8>],
     addresses: &[SocketAddr],
 ) -> io::Result<(usize, usize)> {
@@ -394,7 +394,7 @@ impl UdpRecvBatch {
         #[cfg(target_os = "linux")]
         use std::os::unix::io::AsRawFd;
 
-        let fd = socket.as_raw_fd();
+        let fd: i32 = socket.as_raw_fd() as i32;
 
         // Prepare buffers for receiving
         for packet in self.packets.iter_mut() {
@@ -489,7 +489,7 @@ fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage, _len: u32) -> io::Re
 /// Synchronous helper for recvmmsg (Linux only)
 #[cfg(target_os = "linux")]
 fn recv_mmsg_sync(
-    fd: std::os::unix::io::RawFd,
+    fd: i32,
     packets: &mut [Vec<u8>],
     addresses: &mut [SocketAddr],
     _blocking: bool,
