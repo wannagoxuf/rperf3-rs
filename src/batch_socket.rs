@@ -272,7 +272,7 @@ fn send_mmsg_sync(
     #[cfg(target_env = "musl")]
     let ret = unsafe { sendmmsg(fd, msgvec.as_mut_ptr(), count as u32, MSG_DONTWAIT as u32) };
     #[cfg(not(target_env = "musl"))]
-    let ret = unsafe { sendmmsg(fd, msgvec.as_mut_ptr(), count as u32, MSG_DONTWAIT) };
+    let ret = unsafe { sendmmsg(fd, msgvec.as_mut_ptr(), count as u32, 0) };
 
     if ret < 0 {
         let err = io::Error::last_os_error();

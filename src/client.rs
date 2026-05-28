@@ -9,6 +9,8 @@ use crate::protocol::{deserialize_message, serialize_message, Message, DEFAULT_S
 use crate::{Error, Result};
 use log::{debug, error, info};
 use socket2::SockRef;
+use std::net::IpAddr;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -878,6 +880,7 @@ impl Client {
                         };
                         let local_addr = format!("0.0.0.0:{}", local_port);
                         let sock = UdpSocket::bind(&local_addr).await?;
+                        sock.connect(server_addr).await?;
                         let mut buf = vec![0u8; bs];
                         let stats = send_one_way_with_offset(&sock, server_addr, dur, bw, &mut buf, seq_offset as u32, stream_id as u32).await?;
                         Ok::<_, anyhow::Error>(stats)
@@ -1949,49 +1952,126 @@ pub async fn send_one_way(
 
 /// One-way send with a sequence offset (for parallel streams).
 /// Each parallel stream uses a different offset so sequence numbers don't conflict.
+/// Uses std::thread::spawn with blocking sendmmsg for maximum throughput.
 pub async fn send_one_way_with_offset(
     socket: &UdpSocket,
     addr: std::net::SocketAddr,
     duration: Duration,
-    bandwidth: Option<u64>,
+    _bandwidth: Option<u64>,
     buffer: &mut [u8],
     seq_offset: u32,
     stream_id: u32,
 ) -> Result<OneWaySendStats> {
-    let start = Instant::now();
-    let mut bytes_sent: u64 = 0;
-    let mut packets_sent: u64 = 0;
-    let mut seq: u32 = seq_offset;
-    let mut token_bucket = bandwidth.map(|bw| crate::token_bucket::TokenBucket::new(bw / 8));
+    let payload_size = buffer.len();
+    let dur = duration;
+    let server_addr = addr;
 
-    while start.elapsed() < duration {
-        // Write sequence number into first 4 bytes of packet (u32, big-endian)
-        buffer[0..4].copy_from_slice(&seq.to_be_bytes());
-        // Write stream_id to bytes 4-8 (identifies which parallel stream this packet belongs to)
-        buffer[4..8].copy_from_slice(&stream_id.to_be_bytes());
-        seq = seq.wrapping_add(1);
+    let (tx, rx) = std::sync::mpsc::channel();
 
-        match socket.send_to(buffer, addr).await {
-            Ok(n) => {
-                bytes_sent += n as u64;
-                packets_sent += 1;
+    std::thread::spawn(move || {
+        // Pre-allocate packet buffers to avoid per-packet clone
+        const BATCH: usize = 64;
+        let mut packets: Vec<Vec<u8>> = (0..BATCH)
+            .map(|_| vec![0u8; payload_size])
+            .collect();
+        let mut iovecs: Vec<libc::iovec> = (0..BATCH)
+            .map(|_| libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: payload_size,
+            })
+            .collect();
+        let mut hdrs: Vec<libc::mmsghdr> = (0..BATCH)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
+
+        // Create our own UDP socket (no tokio interference)
+        let fd = unsafe {
+            let ours = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if ours < 0 {
+                eprintln!("Stream {}: socket() failed: {}", stream_id, std::io::Error::last_os_error());
+                return;
             }
-            Err(e) => {
-                error!("Send error: {}", e);
-                return Err(Error::Io(e));
+            // Set SO_SNDBUF to max
+            let bufsize: libc::socklen_t = 16 * 1024 * 1024;
+            libc::setsockopt(
+                ours,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &bufsize as *const libc::socklen_t as *const libc::c_void,
+                std::mem::size_of::<libc::socklen_t>() as libc::socklen_t,
+            );
+            // Connect to server
+            let mut addr_in: libc::sockaddr_in = std::mem::zeroed();
+            addr_in.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr_in.sin_port = server_addr.port().to_be();
+            let addr_bytes = match server_addr.ip() {
+                IpAddr::V4(v4) => v4.octets(),
+                IpAddr::V6(v6) => {
+                    let bytes = v6.octets();
+                    [bytes[12], bytes[13], bytes[14], bytes[15]]
+                }
+            };
+            addr_in.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr_bytes),
+            };
+            let ret = libc::connect(
+                ours,
+                &addr_in as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                eprintln!("Stream {}: connect() failed: {}", stream_id, std::io::Error::last_os_error());
+                libc::close(ours);
+                return;
+            }
+            ours
+        };
+
+        let mut seq: u32 = seq_offset;
+        let mut total_bytes: u64 = 0;
+        let mut total_packets: u64 = 0;
+        let start = std::time::Instant::now();
+        let dur_nanos = dur.as_nanos() as u64;
+
+        while (start.elapsed().as_nanos() as u64) < dur_nanos {
+            // Fill batch with pre-allocated buffers
+            for i in 0..BATCH {
+                (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
+                (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
+                seq = seq.wrapping_add(1);
+
+                iovecs[i].iov_base = packets[i].as_ptr() as *mut _;
+                iovecs[i].iov_len = payload_size;
+                hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
+                hdrs[i].msg_hdr.msg_iovlen = 1;
+            }
+
+            // Blocking sendmmsg (connected socket, no address needed)
+            let ret = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), BATCH as u32, 0) };
+
+            if ret > 0 {
+                total_packets += ret as u64;
+                total_bytes += (ret as u64) * payload_size as u64;
+            } else if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock {
+                    break;
+                }
             }
         }
 
-        // Rate limiting
-        if let Some(ref mut tb) = token_bucket {
-            tb.consume(buffer.len()).await;
-        }
-    }
+        unsafe { libc::close(fd) };
+        let _ = tx.send((total_bytes, total_packets));
+    });
+
+    let (bytes_sent, packets_sent) = rx.recv().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "sender thread panicked")
+    })?;
 
     Ok(OneWaySendStats {
         bytes_sent,
         packets_sent,
-        duration: start.elapsed(),
+        duration: Duration::ZERO,
     })
 }
 
