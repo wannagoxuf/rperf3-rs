@@ -1620,6 +1620,7 @@ pub fn get_system_info() -> SystemInfo {
 /// ```
 #[cfg(target_os = "linux")]
 pub fn get_connection_info(stream: &tokio::net::TcpStream) -> std::io::Result<ConnectionInfo> {
+    #[cfg(target_os = "linux")]
     use std::os::unix::io::AsRawFd;
 
     let local_addr = stream.local_addr()?;
@@ -1711,6 +1712,7 @@ pub fn get_connection_info(stream: &tokio::net::TcpStream) -> std::io::Result<Co
 #[cfg(target_os = "linux")]
 pub fn get_tcp_stats(stream: &tokio::net::TcpStream) -> std::io::Result<TcpStats> {
     use std::mem;
+    #[cfg(target_os = "linux")]
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();

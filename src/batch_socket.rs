@@ -164,6 +164,7 @@ impl UdpSendBatch {
     /// Linux-specific implementation using sendmmsg.
     #[cfg(target_os = "linux")]
     async fn send_mmsg(&mut self, socket: &tokio::net::UdpSocket) -> io::Result<(usize, usize)> {
+        #[cfg(target_os = "linux")]
         use std::os::unix::io::AsRawFd;
 
         if self.is_empty() {
@@ -390,6 +391,7 @@ impl UdpRecvBatch {
     /// Linux-specific implementation using recvmmsg.
     #[cfg(target_os = "linux")]
     async fn recv_mmsg(&mut self, socket: &tokio::net::UdpSocket) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
         use std::os::unix::io::AsRawFd;
 
         let fd = socket.as_raw_fd();
