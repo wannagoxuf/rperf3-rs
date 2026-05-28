@@ -1793,6 +1793,8 @@ async fn recv_one_way_server_mt_tokio(
             let mut local_states: HashMap<u32, StreamState> = HashMap::new();
             let mut local_bytes: u64 = 0;
             let mut local_packets: u64 = 0;
+            let mut last_report = std::time::Instant::now();
+            let report_interval = Duration::from_millis(200);
 
             while running_flag.load(Ordering::SeqCst) {
                 let ret = unsafe {
@@ -1835,9 +1837,19 @@ async fn recv_one_way_server_mt_tokio(
                         state.expected_seq = state.expected_seq.wrapping_add(1);
                     }
                 }
+
+                // Periodically sync to shared atomics so interval stats stay accurate
+                let now = std::time::Instant::now();
+                if now.duration_since(last_report) >= report_interval {
+                    bytes_rx.fetch_add(local_bytes, Ordering::Relaxed);
+                    packets_rx.fetch_add(local_packets, Ordering::Relaxed);
+                    local_bytes = 0;
+                    local_packets = 0;
+                    last_report = now;
+                }
             }
 
-            // Report to main thread via channel
+            // Final sync + report to main thread
             bytes_rx.fetch_add(local_bytes, Ordering::Relaxed);
             packets_rx.fetch_add(local_packets, Ordering::Relaxed);
             let _ = tx.send((local_bytes, local_packets));
