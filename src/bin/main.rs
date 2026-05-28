@@ -183,6 +183,10 @@ enum Commands {
         /// Socket buffer size in bytes (e.g. 32M, 64M) [default: 32M]
         #[arg(short = 'B', long, value_name = "BYTES")]
         socket_buf: Option<String>,
+
+        /// Number of receiver threads for UDP one-way tests (multi-threaded recv) [default: 1]
+        #[arg(short = 'W', long, value_name = "NUM", default_value = "1")]
+        recv_workers: usize,
     },
 
     /// Start client mode and connect to a server
@@ -266,13 +270,15 @@ async fn main() -> anyhow::Result<()> {
             json,
             interval,
             socket_buf,
+            recv_workers,
         } => {
             let protocol = if udp { Protocol::Udp } else { Protocol::Tcp };
 
             let mut config = Config::server(port)
                 .with_protocol(protocol)
                 .with_json(json)
-                .with_interval(Duration::from_secs(interval));
+                .with_interval(Duration::from_secs(interval))
+                .with_recv_workers(recv_workers);
 
             if let Some(bind_addr) = bind {
                 config.bind_addr = Some(bind_addr.parse()?);

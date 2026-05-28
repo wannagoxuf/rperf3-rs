@@ -183,6 +183,9 @@ pub struct Config {
 
     /// Socket buffer size in bytes (0 = use default)
     pub socket_buf: usize,
+
+    /// Number of receiver threads for UDP one-way tests
+    pub recv_workers: usize,
 }
 
 impl Default for Config {
@@ -203,6 +206,7 @@ impl Default for Config {
             one_way: OneWayMode::None,
             expected_pps: None,
             socket_buf: 0,
+            recv_workers: 1,
         }
     }
 }
@@ -528,6 +532,28 @@ impl Config {
     /// ```
     pub fn with_socket_buf(mut self, size: usize) -> Self {
         self.socket_buf = size;
+        self
+    }
+
+    /// Sets the number of receiver threads for UDP one-way tests.
+    ///
+    /// More threads can improve receive throughput for multi-stream UDP tests
+    /// where a single recv thread cannot keep up with the incoming packet rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `workers` - Number of receiver threads (default: 1)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rperf3::Config;
+    ///
+    /// let config = Config::server(5201)
+    ///     .with_recv_workers(4); // Use 4 receiver threads
+    /// ```
+    pub fn with_recv_workers(mut self, workers: usize) -> Self {
+        self.recv_workers = workers;
         self
     }
 }

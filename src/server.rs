@@ -8,8 +8,11 @@ use log::{debug, error, info};
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -811,6 +814,7 @@ async fn handle_udp_test(
             duration,
             config.expected_pps,
             config.buffer_size,
+            config.recv_workers,
         )
         .await?;
         info!("recv_one_way_server returned: bytes={}, packets={}",
@@ -1373,8 +1377,13 @@ pub async fn recv_one_way_server(
     duration: Duration,
     _expected_pps: Option<u64>,
     buffer_size: usize,
+    recv_workers: usize,
 ) -> Result<ServerOneWayStats> {
-    recv_one_way_server_with_socket(socket, duration, buffer_size).await
+    if recv_workers > 1 {
+        recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
+    } else {
+        recv_one_way_server_with_socket(socket, duration, buffer_size).await
+    }
 }
 
 /// Internal version that takes an extra port parameter for multi-stream reception.
@@ -1716,6 +1725,209 @@ async fn recv_one_way_server_with_socket(
         packets_received,
         out_of_order,
         packets_lost,
+        packet_loss,
+        duration: start.elapsed(),
+    })
+}
+
+// ============================================================================
+// Multi-threaded UDP receiver (tokio socket fd duplicated to native threads)
+// ============================================================================
+
+/// Multi-threaded UDP receiver using tokio socket fd duplication.
+/// Each worker thread gets a duplicated fd of the same tokio UdpSocket.
+async fn recv_one_way_server_mt_tokio(
+    socket: &UdpSocket,
+    duration: Duration,
+    buffer_size: usize,
+    num_workers: usize,
+) -> Result<ServerOneWayStats> {
+    info!("recv_one_way_server_mt_tokio: starting, duration={:?}, workers={}",
+          duration, num_workers);
+
+    let socket_fd = socket.as_raw_fd();
+
+    let mut worker_fds: Vec<i32> = Vec::with_capacity(num_workers);
+    for i in 0..num_workers {
+        let dup_fd = unsafe { libc::dup(socket_fd) };
+        if dup_fd < 0 {
+            error!("Worker {}: dup fd failed: {}", i, std::io::Error::last_os_error());
+            continue;
+        }
+        worker_fds.push(dup_fd);
+    }
+    if worker_fds.is_empty() {
+        return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no fds")));
+    }
+
+    let bytes_received = Arc::new(AtomicU64::new(0));
+    let packets_received = Arc::new(AtomicU64::new(0));
+    let out_of_order = Arc::new(AtomicU64::new(0));
+    let packets_lost = Arc::new(AtomicU64::new(0));
+    let stream_states = Arc::new(RwLock::new(HashMap::<u32, StreamState>::new()));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let start = Instant::now();
+    let test_end = start + duration;
+
+    let mut handles = Vec::new();
+    for &fd in &worker_fds {
+        let bytes_rx = bytes_received.clone();
+        let packets_rx = packets_received.clone();
+        let ooo_cnt = out_of_order.clone();
+        let lost_cnt = packets_lost.clone();
+        let states = stream_states.clone();
+        let running_flag = running.clone();
+
+        let handle = thread::spawn(move || {
+            let mut buf = vec![0u8; buffer_size];
+            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+            loop {
+                if !running_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let ret = unsafe {
+                    libc::recvfrom(
+                        fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        0,
+                        &mut addr as *mut _ as *mut _,
+                        &mut addr_len,
+                    )
+                };
+
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        thread::yield_now();
+                        continue;
+                    }
+                    thread::yield_now();
+                    continue;
+                }
+
+                let n = ret as usize;
+                bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                packets_rx.fetch_add(1, Ordering::Relaxed);
+
+                if n >= 8 {
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+                    let mut states_guard = states.write().unwrap();
+                    let state = states_guard
+                        .entry(stream_id)
+                        .or_insert_with(|| StreamState::new(seq));
+
+                    if seq > state.expected_seq {
+                        let gap = (seq - state.expected_seq) as u64;
+                        lost_cnt.fetch_add(gap, Ordering::Relaxed);
+                        state.expected_seq = seq.wrapping_add(1);
+                    } else if seq < state.expected_seq {
+                        ooo_cnt.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        state.expected_seq = state.expected_seq.wrapping_add(1);
+                    }
+                }
+            }
+            unsafe { libc::close(fd); }
+        });
+        handles.push(handle);
+    }
+
+    // Interval stats
+    let mut prev_interval_end = start;
+    let mut prev_total_bytes: u64 = 0;
+
+    loop {
+        let now = Instant::now();
+        if now >= test_end {
+            break;
+        }
+        let remaining = test_end - now;
+        let sleep_dur = std::cmp::min(remaining, Duration::from_secs(1));
+        tokio::time::sleep(sleep_dur).await;
+
+        let current = Instant::now();
+        if current >= test_end {
+            break;
+        }
+
+        let current_total = bytes_received.load(Ordering::SeqCst);
+        let current_pkts = packets_received.load(Ordering::SeqCst);
+        let current_lost = packets_lost.load(Ordering::SeqCst);
+
+        if current.saturating_duration_since(prev_interval_end).as_secs_f64() >= 0.9 {
+            let elapsed = current.saturating_duration_since(start).as_secs_f64();
+            let interval_b = current_total.wrapping_sub(prev_total_bytes);
+            let interval_elapsed = current.saturating_duration_since(prev_interval_end).as_secs_f64();
+            let rate_gbps = if interval_elapsed > 0.0 {
+                (interval_b as f64 * 8.0) / (interval_elapsed * 1e9)
+            } else {
+                0.0
+            };
+            let total_sent = current_pkts + current_lost;
+            let loss_pct = if total_sent > 0 {
+                (current_lost as f64 / total_sent as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            println!(
+                "[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}, lost={}, loss={:.2}%",
+                elapsed, rate_gbps, current_pkts, current_total, current_lost, loss_pct
+            );
+
+            prev_total_bytes = current_total;
+            prev_interval_end = current;
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(200));
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    let total_bytes = bytes_received.load(Ordering::SeqCst);
+    let total_packets = packets_received.load(Ordering::SeqCst);
+    let total_lost = packets_lost.load(Ordering::SeqCst);
+    let total_ooo = out_of_order.load(Ordering::SeqCst);
+
+    let total_sent = total_packets + total_lost;
+    let packet_loss = if total_sent > 0 {
+        Some((total_lost as f64 / total_sent as f64) * 100.0)
+    } else {
+        None
+    };
+
+    let total_elapsed = start.elapsed().as_secs_f64();
+    let final_rate_gbps = if total_elapsed > 0.0 {
+        (total_bytes as f64 * 8.0) / (total_elapsed * 1e9)
+    } else {
+        0.0
+    };
+    let loss_str = match packet_loss {
+        Some(loss) => format!(", lost={}, loss={:.2}%", total_lost, loss),
+        None => String::new(),
+    };
+    println!(
+        "[{:.1}s] recv rate: {:.3} Gbps, total packets={}, bytes={}, out_of_order={}{}",
+        total_elapsed, final_rate_gbps, total_packets, total_bytes, total_ooo, loss_str
+    );
+    info!("recv_one_way_server_mt_tokio finished: bytes={}, packets={}",
+          total_bytes, total_packets);
+
+    Ok(ServerOneWayStats {
+        bytes_received: total_bytes,
+        packets_received: total_packets,
+        out_of_order: total_ooo,
+        packets_lost: total_lost,
         packet_loss,
         duration: start.elapsed(),
     })
