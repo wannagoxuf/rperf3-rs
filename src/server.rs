@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(all(unix, target_os = "linux"))]
 use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawFd;
+use std::os::windows::io::AsRawSocket;
+use std::os::windows::prelude::RawSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 mod windows_socket_dup {
-    use std::os::windows::io::{AsRawSocket, RawSocket};
+    use std::os::windows::io::AsRawSocket;
+    use std::os::windows::prelude::RawSocket;
     use tokio::net::UdpSocket;
     use std::ptr::null_mut;
 
@@ -2032,7 +2033,7 @@ async fn recv_one_way_server_mt_windows(
     let (tx, rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
     let start = Instant::now();
-    let test_end = start + duration;
+    let test_duration = duration;
 
     let mut handles = Vec::new();
     for (i, raw_sock) in worker_sockets.into_iter().enumerate() {
@@ -2048,8 +2049,6 @@ async fn recv_one_way_server_mt_windows(
             let mut last_report = std::time::Instant::now();
             let report_interval = Duration::from_millis(200);
             let mut local_states: HashMap<u32, StreamState> = HashMap::new();
-            let mut src_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            let mut addr_len: libc::c_int = std::mem::size_of::<libc::sockaddr_in>() as libc::c_int;
 
             while running_flag.load(Ordering::SeqCst) {
                 let ret = unsafe {
@@ -2058,8 +2057,8 @@ async fn recv_one_way_server_mt_windows(
                         buf.as_mut_ptr() as *mut libc::c_char,
                         buf.len() as libc::c_int,
                         0,
-                        &mut src_addr as *mut _ as *mut libc::sockaddr,
-                        &mut addr_len,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
                     )
                 };
 
@@ -2110,7 +2109,7 @@ async fn recv_one_way_server_mt_windows(
     let mut prev_total_bytes: u64 = 0;
     loop {
         let elapsed = start.elapsed();
-        if elapsed >= test_end {
+        if elapsed >= test_duration {
             running.store(false, Ordering::SeqCst);
             break;
         }

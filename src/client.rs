@@ -10,10 +10,6 @@ use crate::{Error, Result};
 use log::{debug, error, info};
 use socket2::SockRef;
 use std::net::IpAddr;
-#[cfg(all(unix, target_os = "linux"))]
-use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -864,58 +860,63 @@ impl Client {
                     stats.bytes_sent, stats.packets_sent, stats.duration);
             } else {
                 // Multiple streams — spawn N independent tasks, each with its own socket
-                println!("Starting {} parallel one-way send streams...", num_streams);
-                let mut handles = Vec::new();
-                for stream_id in 0..num_streams {
-                    let dur = duration;
-                    let bw = bandwidth;
-                    let bs = buffer_size;
-                    // Stagger sequence space per stream to avoid sequence conflicts at receiver
-                    let seq_offset = (stream_id as u64) * 10_000_000;
-
-                    let handle = tokio::spawn(async move {
-                        // All streams send to the same server port (5201)
-                        // Each stream uses a different local port to avoid conflicts
-                        let local_port = if stream_id == 0 {
-                            0 // OS assigns random port for first stream
-                        } else {
-                            5201 + stream_id as u16
-                        };
-                        let local_addr = format!("0.0.0.0:{}", local_port);
-                        let sock = UdpSocket::bind(&local_addr).await?;
-                        sock.connect(server_addr).await?;
-                        let mut buf = vec![0u8; bs];
-                        let stats = send_one_way_with_offset(&sock, server_addr, dur, bw, &mut buf, seq_offset as u32, stream_id as u32).await?;
-                        Ok::<_, anyhow::Error>(stats)
-                    });
-                    handles.push(handle);
-                }
-
-                let mut join_set = JoinSet::new();
-                for (i, handle) in handles.into_iter().enumerate() {
-                    join_set.spawn(async move { (i, handle.await) });
-                }
-                let mut total_bytes: u64 = 0;
-                let mut total_packets: u64 = 0;
-                while let Some(result) = join_set.join_next().await {
-                    match result {
-                        Ok((i, Ok(Ok(stats)))) => {
-                            total_bytes += stats.bytes_sent;
-                            total_packets += stats.packets_sent;
-                        }
-                        Ok((i, Ok(Err(e)))) => {
-                            eprintln!("Stream {} error: {}", i, e);
-                        }
-                        Ok((_, Err(e))) => {
-                            eprintln!("Join error: {:?}", e);
-                        }
-                        Err(e) => {
-                            eprintln!("Stream panicked: {:?}", e);
+                #[cfg(target_os = "linux")]
+                {
+                    println!("Starting {} parallel one-way send streams...", num_streams);
+                    let mut handles = Vec::new();
+                    for stream_id in 0..num_streams {
+                        let dur = duration;
+                        let bw = bandwidth;
+                        let bs = buffer_size;
+                        let seq_offset = (stream_id as u64) * 10_000_000;
+                        let handle = tokio::spawn(async move {
+                            let local_port = if stream_id == 0 {
+                                0
+                            } else {
+                                5201 + stream_id as u16
+                            };
+                            let local_addr = format!("0.0.0.0:{}", local_port);
+                            let sock = UdpSocket::bind(&local_addr).await?;
+                            sock.connect(server_addr).await?;
+                            let mut buf = vec![0u8; bs];
+                            let stats = send_one_way_with_offset(&sock, server_addr, dur, bw, &mut buf, seq_offset as u32, stream_id as u32).await?;
+                            Ok::<_, anyhow::Error>(stats)
+                        });
+                        handles.push(handle);
+                    }
+                    let mut join_set = JoinSet::new();
+                    for (i, handle) in handles.into_iter().enumerate() {
+                        join_set.spawn(async move { (i, handle.await) });
+                    }
+                    let mut total_bytes: u64 = 0;
+                    let mut total_packets: u64 = 0;
+                    while let Some(result) = join_set.join_next().await {
+                        match result {
+                            Ok((i, Ok(Ok(stats)))) => {
+                                total_bytes += stats.bytes_sent;
+                                total_packets += stats.packets_sent;
+                            }
+                            Ok((i, Ok(Err(e)))) => {
+                                eprintln!("Stream {} error: {}", i, e);
+                            }
+                            Ok((_, Err(e))) => {
+                                eprintln!("Join error: {:?}", e);
+                            }
+                            Err(e) => {
+                                eprintln!("Stream panicked: {:?}", e);
+                            }
                         }
                     }
+                    println!("One-way send stats: bytes={}, packets={}", total_bytes, total_packets);
                 }
-                println!("One-way send stats: bytes={}, packets={}, streams={}",
-                    total_bytes, total_packets, num_streams);
+                #[cfg(not(target_os = "linux"))]
+                {
+                    eprintln!("Warning: multi-stream not supported on this platform, using single stream");
+                    let mut buffer = vec![0u8; buffer_size];
+                    let stats = send_one_way(&socket, server_addr, duration, bandwidth, &mut buffer).await?;
+                    println!("One-way send stats: bytes={}, packets={}, duration={:?}",
+                        stats.bytes_sent, stats.packets_sent, stats.duration);
+                }
             }
             Ok(())
         } else if self.config.one_way == OneWayMode::Receive {
@@ -1955,7 +1956,8 @@ pub async fn send_one_way(
 
 /// One-way send with a sequence offset (for parallel streams).
 /// Each parallel stream uses a different offset so sequence numbers don't conflict.
-/// Uses std::thread::spawn with blocking sendmmsg for maximum throughput.
+/// Uses std::thread::spawn with blocking sendmmsg for maximum throughput (Linux only).
+#[cfg(target_os = "linux")]
 pub async fn send_one_way_with_offset(
     socket: &UdpSocket,
     addr: std::net::SocketAddr,
