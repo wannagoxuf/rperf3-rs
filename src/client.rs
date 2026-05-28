@@ -1974,12 +1974,16 @@ pub async fn send_one_way_with_offset(
         let mut packets: Vec<Vec<u8>> = (0..BATCH)
             .map(|_| vec![0u8; payload_size])
             .collect();
+
+        // mmsghdr and iovec arrays are Linux-only (sendmmsg)
+        #[cfg(target_os = "linux")]
         let mut iovecs: Vec<libc::iovec> = (0..BATCH)
             .map(|_| libc::iovec {
                 iov_base: std::ptr::null_mut(),
                 iov_len: payload_size,
             })
             .collect();
+        #[cfg(target_os = "linux")]
         let mut hdrs: Vec<libc::mmsghdr> = (0..BATCH)
             .map(|_| unsafe { std::mem::zeroed() })
             .collect();
@@ -2034,28 +2038,52 @@ pub async fn send_one_way_with_offset(
         let dur_nanos = dur.as_nanos() as u64;
 
         while (start.elapsed().as_nanos() as u64) < dur_nanos {
-            // Fill batch with pre-allocated buffers
-            for i in 0..BATCH {
-                (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
-                (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
-                seq = seq.wrapping_add(1);
+            #[cfg(target_os = "linux")]
+            {
+                // Fill batch with pre-allocated buffers
+                for i in 0..BATCH {
+                    (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
+                    (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
+                    seq = seq.wrapping_add(1);
 
-                iovecs[i].iov_base = packets[i].as_ptr() as *mut _;
-                iovecs[i].iov_len = payload_size;
-                hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
-                hdrs[i].msg_hdr.msg_iovlen = 1;
+                    iovecs[i].iov_base = packets[i].as_ptr() as *mut _;
+                    iovecs[i].iov_len = payload_size;
+                    hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
+                    hdrs[i].msg_hdr.msg_iovlen = 1;
+                }
+
+                // Blocking sendmmsg (Linux only)
+                let ret = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), BATCH as u32, 0) };
+                if ret > 0 {
+                    total_packets += ret as u64;
+                    total_bytes += (ret as u64) * payload_size as u64;
+                } else if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                }
             }
+            #[cfg(target_os = "macos")]
+            {
+                // macOS: use send() in a loop (no sendmmsg available)
+                for i in 0..BATCH {
+                    (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
+                    (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
+                    seq = seq.wrapping_add(1);
 
-            // Blocking sendmmsg (connected socket, no address needed)
-            let ret = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), BATCH as u32, 0) };
-
-            if ret > 0 {
-                total_packets += ret as u64;
-                total_bytes += (ret as u64) * payload_size as u64;
-            } else if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock {
-                    break;
+                    let ret = unsafe {
+                        libc::send(fd, packets[i].as_ptr() as *const _, payload_size, 0)
+                    };
+                    if ret > 0 {
+                        total_packets += 1;
+                        total_bytes += ret as u64;
+                    } else if ret < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::WouldBlock {
+                            break;
+                        }
+                    }
                 }
             }
         }
