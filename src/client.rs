@@ -10,7 +10,7 @@ use crate::{Error, Result};
 use log::{debug, error, info};
 use socket2::SockRef;
 use std::net::IpAddr;
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "linux"))]
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawFd;
