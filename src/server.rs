@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(all(unix, target_os = "linux"))]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawSocket;
+#[cfg(target_os = "windows")]
 use std::os::windows::prelude::RawSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
