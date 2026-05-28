@@ -1382,18 +1382,15 @@ pub async fn recv_one_way_server(
     buffer_size: usize,
     recv_workers: usize,
 ) -> Result<ServerOneWayStats> {
+    // Use multi-threaded recv on Linux for best performance, single-thread elsewhere
     #[cfg(target_os = "linux")]
-    {
-        if recv_workers > 1 {
-            recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
-        } else {
-            recv_one_way_server_with_socket(socket, duration, buffer_size).await
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
+    if recv_workers > 1 {
+        recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
+    } else {
         recv_one_way_server_with_socket(socket, duration, buffer_size).await
     }
+    #[cfg(not(target_os = "linux"))]
+    recv_one_way_server_with_socket(socket, duration, buffer_size).await
 }
 
 /// Internal version that takes an extra port parameter for multi-stream reception.
