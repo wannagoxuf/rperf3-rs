@@ -17,6 +17,47 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+// ============================================================================
+// Windows multi-threaded UDP receiver using DuplicateHandle + native recv
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+mod windows_socket_dup {
+    use std::os::windows::io::{AsRawSocket, RawSocket};
+    use tokio::net::UdpSocket;
+    use std::ptr::null_mut;
+
+    type HANDLE = *mut std::ffi::c_void;
+    type DWORD = u32;
+    type BOOL = i32;
+    const DUPLICATE_SAME_ACCESS: DWORD = 0x00000002;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> HANDLE;
+        fn DuplicateHandle(
+            hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE,
+            hTargetProcessHandle: HANDLE, lpTargetHandle: *mut HANDLE,
+            dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwOptions: DWORD,
+        ) -> BOOL;
+    }
+
+    pub fn duplicate_socket_for_thread(socket: &UdpSocket) -> std::io::Result<RawSocket> {
+        let raw_socket = socket.as_raw_socket();
+        let self_process = unsafe { GetCurrentProcess() };
+        let mut new_handle: HANDLE = null_mut();
+        let result = unsafe {
+            DuplicateHandle(self_process, raw_socket as HANDLE, self_process,
+                           &mut new_handle, 0, 1, DUPLICATE_SAME_ACCESS)
+        };
+        if result == 0 { return Err(std::io::Error::last_os_error()); }
+        Ok(new_handle as RawSocket)
+    }
+}
+
+#[cfg(target_os = "windows")]
+use windows_socket_dup::duplicate_socket_for_thread;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time;
@@ -1382,15 +1423,26 @@ pub async fn recv_one_way_server(
     buffer_size: usize,
     recv_workers: usize,
 ) -> Result<ServerOneWayStats> {
-    // Use multi-threaded recv on Linux for best performance, single-thread elsewhere
     #[cfg(target_os = "linux")]
-    if recv_workers > 1 {
-        recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
-    } else {
+    {
+        if recv_workers > 1 {
+            recv_one_way_server_mt_tokio(socket, duration, buffer_size, recv_workers).await
+        } else {
+            recv_one_way_server_with_socket(socket, duration, buffer_size).await
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if recv_workers > 1 {
+            recv_one_way_server_mt_windows(socket, duration, buffer_size, recv_workers).await
+        } else {
+            recv_one_way_server_with_socket(socket, duration, buffer_size).await
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
         recv_one_way_server_with_socket(socket, duration, buffer_size).await
     }
-    #[cfg(not(target_os = "linux"))]
-    recv_one_way_server_with_socket(socket, duration, buffer_size).await
 }
 
 /// Internal version that takes an extra port parameter for multi-stream reception.
@@ -1933,6 +1985,161 @@ async fn recv_one_way_server_mt_tokio(
     // NOTE: per-stream loss tracking is skipped in multi-worker mode because
     // kernel RSS distributes same stream across workers. True loss must be
     // derived by comparing client-sent vs server-received bytes.
+
+    Ok(ServerOneWayStats {
+        bytes_received: total_bytes,
+        packets_received: total_packets,
+        out_of_order: 0,
+        packets_lost: 0,
+        packet_loss: None,
+        duration: start.elapsed(),
+    })
+}
+
+// ============================================================================
+// Windows multi-threaded UDP receiver using DuplicateHandle + native recv
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+async fn recv_one_way_server_mt_windows(
+    socket: &UdpSocket,
+    duration: Duration,
+    buffer_size: usize,
+    num_workers: usize,
+) -> Result<ServerOneWayStats> {
+    info!("recv_one_way_server_mt_windows: starting, duration={:?}, workers={}",
+          duration, num_workers);
+
+    let mut worker_sockets: Vec<RawSocket> = Vec::with_capacity(num_workers);
+    for i in 0..num_workers {
+        match duplicate_socket_for_thread(socket) {
+            Ok(raw_fd) => {
+                info!("Worker {}: duplicated socket fd={}", i, raw_fd);
+                worker_sockets.push(raw_fd);
+            }
+            Err(e) => {
+                error!("Worker {}: duplicate_socket_for_thread failed: {}", i, e);
+            }
+        }
+    }
+
+    if worker_sockets.is_empty() {
+        return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no duplicated sockets")));
+    }
+
+    let bytes_received = Arc::new(AtomicU64::new(0));
+    let packets_received = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let running = Arc::new(AtomicBool::new(true));
+    let start = Instant::now();
+    let test_end = start + duration;
+
+    let mut handles = Vec::new();
+    for (i, raw_sock) in worker_sockets.into_iter().enumerate() {
+        let bytes_rx = bytes_received.clone();
+        let packets_rx = packets_received.clone();
+        let running_flag = running.clone();
+        let tx = tx.clone();
+
+        let handle = thread::spawn(move || {
+            let mut buf = vec![0u8; buffer_size];
+            let mut local_bytes: u64 = 0;
+            let mut local_packets: u64 = 0;
+            let mut last_report = std::time::Instant::now();
+            let report_interval = Duration::from_millis(200);
+            let mut local_states: HashMap<u32, StreamState> = HashMap::new();
+            let mut src_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut addr_len: libc::socklen_t = std::mem::size_of_val(&src_addr) as libc::socklen_t;
+
+            while running_flag.load(Ordering::SeqCst) {
+                let ret = unsafe {
+                    libc::recvfrom(
+                        raw_sock as libc::c_int,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(), 0,
+                        &mut src_addr as *mut _ as *mut libc::sockaddr,
+                        &mut addr_len,
+                    )
+                };
+
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    if err.raw_os_error() == Some(10035) { continue; }
+                    continue;
+                }
+
+                let n = ret as usize;
+                local_bytes += n as u64;
+                local_packets += 1;
+
+                if n >= 8 {
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    let state = local_states.entry(stream_id)
+                        .or_insert_with(|| StreamState::new(seq));
+                    if seq > state.expected_seq {
+                        state.expected_seq = seq.wrapping_add(1);
+                    } else if seq < state.expected_seq {
+                    } else {
+                        state.expected_seq = state.expected_seq.wrapping_add(1);
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                if now.duration_since(last_report) >= report_interval {
+                    bytes_rx.fetch_add(local_bytes, Ordering::Relaxed);
+                    packets_rx.fetch_add(local_packets, Ordering::Relaxed);
+                    local_bytes = 0;
+                    local_packets = 0;
+                    last_report = now;
+                }
+            }
+
+            bytes_rx.fetch_add(local_bytes, Ordering::Relaxed);
+            packets_rx.fetch_add(local_packets, Ordering::Relaxed);
+            let _ = tx.send((local_bytes, local_packets));
+            info!("Worker {}: exiting", i);
+        });
+        handles.push(handle);
+    }
+
+    let mut prev_total_bytes: u64 = 0;
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= test_end {
+            running.store(false, Ordering::SeqCst);
+            break;
+        }
+        let current_bytes = bytes_received.load(Ordering::SeqCst);
+        let current_packets = packets_received.load(Ordering::SeqCst);
+        let interval_bytes = current_bytes.saturating_sub(prev_total_bytes);
+        let interval_elapsed = elapsed.as_secs_f64();
+        if interval_elapsed > 0.0 && interval_bytes > 0 {
+            let rate_gbps = (interval_bytes as f64 * 8.0) / (interval_elapsed * 1e9);
+            println!("[{:.1}s] recv rate: {:.3} Gbps, packets={}, bytes={}",
+                     interval_elapsed, rate_gbps, current_packets, current_bytes);
+        }
+        prev_total_bytes = current_bytes;
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok((w_bytes, w_pkts)) => { info!("Worker done: bytes={}, pkts={}", w_bytes, w_pkts); }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    for handle in handles { let _ = handle.join(); }
+
+    let total_bytes = bytes_received.load(Ordering::SeqCst);
+    let total_packets = packets_received.load(Ordering::SeqCst);
+    let total_elapsed = start.elapsed().as_secs_f64();
+    let final_rate_gbps = if total_elapsed > 0.0 {
+        (total_bytes as f64 * 8.0) / (total_elapsed * 1e9)
+    } else { 0.0 };
+    println!("[{:.1}s] recv rate: {:.3} Gbps, total packets={}, bytes={}",
+             total_elapsed, final_rate_gbps, total_packets, total_bytes);
 
     Ok(ServerOneWayStats {
         bytes_received: total_bytes,
