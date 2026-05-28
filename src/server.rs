@@ -2049,14 +2049,15 @@ async fn recv_one_way_server_mt_windows(
             let report_interval = Duration::from_millis(200);
             let mut local_states: HashMap<u32, StreamState> = HashMap::new();
             let mut src_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            let mut addr_len: libc::socklen_t = std::mem::size_of_val(&src_addr) as libc::socklen_t;
+            let mut addr_len: libc::c_int = std::mem::size_of::<libc::sockaddr_in>() as libc::c_int;
 
             while running_flag.load(Ordering::SeqCst) {
                 let ret = unsafe {
                     libc::recvfrom(
-                        raw_sock as libc::c_int,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(), 0,
+                        raw_sock as libc::SOCKET,
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len() as libc::c_int,
+                        0,
                         &mut src_addr as *mut _ as *mut libc::sockaddr,
                         &mut addr_len,
                     )
