@@ -206,7 +206,9 @@ impl Default for Config {
             one_way: OneWayMode::None,
             expected_pps: None,
             socket_buf: 0,
-            recv_workers: 1,
+            recv_workers: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
         }
     }
 }
