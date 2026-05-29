@@ -207,6 +207,9 @@ pub mod server;
 pub mod token_bucket;
 pub mod udp_packet;
 
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_socket_dup;
+
 pub use batch_socket::{UdpRecvBatch, UdpSendBatch, MAX_BATCH_SIZE};
 pub use client::{Client, ProgressCallback, ProgressEvent};
 pub use config::{Config, Protocol};
