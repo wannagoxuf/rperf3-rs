@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 type HANDLE = *mut std::ffi::c_void;
 type DWORD = u32;
 type BOOL = i32;
-type SOCKET = usize;
+pub type SOCKET = usize;
 const DUPLICATE_SAME_ACCESS: DWORD = 0x00000002;
 
 // WSABUF and WSASend constants

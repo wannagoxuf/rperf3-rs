@@ -7,6 +7,8 @@ use crate::measurements::{
 };
 use crate::protocol::{deserialize_message, serialize_message, Message, DEFAULT_STREAM_ID};
 use crate::{Error, Result};
+#[cfg(target_os = "windows")]
+use crate::windows_socket_dup::{close_socket, wsasend_batch, WSABUF, WSABUF_len, SOCKET};
 use log::{debug, error, info};
 use socket2::SockRef;
 use std::net::IpAddr;
