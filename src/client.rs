@@ -2076,7 +2076,7 @@ pub async fn send_one_way_with_offset(
             );
             if ret < 0 {
                 eprintln!("Stream {}: connect() failed: {}", stream_id, std::io::Error::last_os_error());
-                libc::close(ours);
+                close_socket(ours);
                 return;
             }
             ours as windows_socket_dup::SOCKET
