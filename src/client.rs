@@ -1994,6 +1994,95 @@ pub async fn send_one_way_with_offset(
             .collect();
 
         // Create our own UDP socket (no tokio interference)
+        // Linux: use libc socket API
+        #[cfg(target_os = "linux")]
+        let fd = unsafe {
+            let ours = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if ours < 0 {
+                eprintln!("Stream {}: socket() failed: {}", stream_id, std::io::Error::last_os_error());
+                return;
+            }
+            // Set SO_SNDBUF to max
+            let bufsize: libc::socklen_t = 16 * 1024 * 1024;
+            libc::setsockopt(
+                ours,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &bufsize as *const libc::socklen_t as *const libc::c_void,
+                std::mem::size_of::<libc::socklen_t>() as libc::socklen_t,
+            );
+            // Connect to server
+            let mut addr_in: libc::sockaddr_in = std::mem::zeroed();
+            addr_in.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr_in.sin_port = server_addr.port().to_be();
+            let addr_bytes = match server_addr.ip() {
+                IpAddr::V4(v4) => v4.octets(),
+                IpAddr::V6(v6) => {
+                    let bytes = v6.octets();
+                    [bytes[12], bytes[13], bytes[14], bytes[15]]
+                }
+            };
+            addr_in.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr_bytes),
+            };
+            let ret = libc::connect(
+                ours,
+                &addr_in as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                eprintln!("Stream {}: connect() failed: {}", stream_id, std::io::Error::last_os_error());
+                libc::close(ours);
+                return;
+            }
+            ours
+        };
+        // Windows: use WSA socket API
+        #[cfg(target_os = "windows")]
+        let fd: windows_socket_dup::SOCKET = unsafe {
+            use windows_socket_dup::{WSABUF, WSABUF_len, close_socket};
+            let ours = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if ours < 0 {
+                eprintln!("Stream {}: socket() failed: {}", stream_id, std::io::Error::last_os_error());
+                return;
+            }
+            // Set SO_SNDBUF to max
+            let bufsize: libc::socklen_t = 16 * 1024 * 1024;
+            libc::setsockopt(
+                ours,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &bufsize as *const libc::socklen_t as *const libc::c_void,
+                std::mem::size_of::<libc::socklen_t>() as libc::socklen_t,
+            );
+            // Connect to server
+            let mut addr_in: libc::sockaddr_in = std::mem::zeroed();
+            addr_in.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr_in.sin_port = server_addr.port().to_be();
+            let addr_bytes = match server_addr.ip() {
+                IpAddr::V4(v4) => v4.octets(),
+                IpAddr::V6(v6) => {
+                    let bytes = v6.octets();
+                    [bytes[12], bytes[13], bytes[14], bytes[15]]
+                }
+            };
+            addr_in.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr_bytes),
+            };
+            let ret = libc::connect(
+                ours,
+                &addr_in as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                eprintln!("Stream {}: connect() failed: {}", stream_id, std::io::Error::last_os_error());
+                libc::close(ours);
+                return;
+            }
+            ours as windows_socket_dup::SOCKET
+        };
+        // macOS: use libc socket API
+        #[cfg(target_os = "macos")]
         let fd = unsafe {
             let ours = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
             if ours < 0 {
@@ -2064,8 +2153,8 @@ pub async fn send_one_way_with_offset(
                     if err.kind() != std::io::ErrorKind::WouldBlock { break; }
                 }
             }
-            // macOS / Windows: fallback to send() loop (no sendmmsg)
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            // macOS: fallback to send() loop (no sendmmsg)
+            #[cfg(target_os = "macos")]
             {
                 for i in 0..BATCH {
                     (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
@@ -2084,15 +2173,16 @@ pub async fn send_one_way_with_offset(
             // Windows batch send via WSASend
             #[cfg(target_os = "windows")]
             {
+                use windows_socket_dup::wsasend_batch;
                 for i in 0..BATCH {
                     (&mut packets[i][0..4]).copy_from_slice(&seq.to_be_bytes());
                     (&mut packets[i][4..8]).copy_from_slice(&stream_id.to_be_bytes());
                     seq = seq.wrapping_add(1);
-                    wsabufs[i].len = payload_size as windows_socket_dup::WSABUF_len;
+                    wsabufs[i].len = payload_size as WSABUF_len;
                     wsabufs[i].buf = packets[i].as_ptr() as *mut u8;
                 }
                 let sent = unsafe {
-                    windows_socket_dup::wsasend_batch(fd, &packets[..BATCH], &mut wsabufs[..BATCH])
+                    wsasend_batch(fd, &packets[..BATCH], &mut wsabufs[..BATCH])
                 };
                 if sent > 0 {
                     total_packets += sent as u64;
@@ -2106,7 +2196,7 @@ pub async fn send_one_way_with_offset(
         #[cfg(target_os = "linux")]
         unsafe { libc::close(fd); }
         #[cfg(target_os = "windows")]
-        windows_socket_dup::close_socket(fd as windows_socket_dup::SOCKET);
+        close_socket(fd);
         let _ = tx.send((total_bytes, total_packets));
     });
 
