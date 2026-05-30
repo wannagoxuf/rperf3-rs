@@ -1,6 +1,7 @@
 //! Windows socket duplication and WSASend FFI bindings.
 //! Provides DuplicateHandle for multi-threaded UDP receive and batched WSASend for high-throughput sending.
 
+use std::ffi::c_void;
 use std::os::windows::io::AsRawSocket;
 use std::os::windows::prelude::RawSocket;
 use tokio::net::UdpSocket;
@@ -68,6 +69,9 @@ extern "system" {
         lpCompletionRoutine: *mut std::ffi::c_void,
     ) -> i32;
     fn closesocket(s: SOCKET) -> i32;
+    fn socket(domain: i32, stype: i32, protocol: i32) -> SOCKET;
+    fn connect(s: SOCKET, name: *const sockaddr, namelen: i32) -> i32;
+    fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: *const c_void, optlen: i32) -> i32;
 }
 
 pub fn duplicate_socket_for_thread(socket: &UdpSocket) -> std::io::Result<RawSocket> {

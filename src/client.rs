@@ -2040,24 +2040,25 @@ pub async fn send_one_way_with_offset(
         // Windows: use WSA socket API
         #[cfg(target_os = "windows")]
         let fd: windows_socket_dup::SOCKET = unsafe {
-            use windows_socket_dup::{WSABUF, WSABUF_len, close_socket, SOCKET};
-            use std::os::windows::io::FromRawFd;
-            // Use socket2 for WSASocketW on Windows
-            let ours = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )
-            .expect("WSASocketW failed");
-            let raw_fd = ours.into_raw_fd();
+            use windows_socket_dup::{close_socket, socket, connect, setsockopt, SOCKET};
+            // Create UDP socket via WSA
+            let ours = socket(
+                libc::AF_INET as i32,
+                libc::SOCK_DGRAM as i32,
+                libc::IPPROTO_UDP as i32,
+            );
+            if ours == 0 || ours == windows_socket_dup::SOCKET::MAX {
+                eprintln!("Stream {}: socket() failed: {}", stream_id, std::io::Error::last_os_error());
+                return;
+            }
             // Set SO_SNDBUF to max
             let bufsize: i32 = 16 * 1024 * 1024;
-            libc::setsockopt(
-                raw_fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
+            setsockopt(
+                ours,
+                libc::SOL_SOCKET as i32,
+                libc::SO_SNDBUF as i32,
                 &bufsize as *const i32 as *const libc::c_void,
-                std::mem::size_of::<i32>() as libc::socklen_t,
+                std::mem::size_of::<i32>() as i32,
             );
             // Connect to server
             let mut addr_in: libc::sockaddr_in = std::mem::zeroed();
@@ -2073,17 +2074,17 @@ pub async fn send_one_way_with_offset(
             addr_in.sin_addr = libc::in_addr {
                 s_addr: u32::from_ne_bytes(addr_bytes),
             };
-            let ret = libc::connect(
-                raw_fd,
+            let ret = connect(
+                ours,
                 &addr_in as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                std::mem::size_of::<libc::sockaddr_in>() as i32,
             );
             if ret < 0 {
                 eprintln!("Stream {}: connect() failed: {}", stream_id, std::io::Error::last_os_error());
-                close_socket(raw_fd as SOCKET);
+                close_socket(ours);
                 return;
             }
-            raw_fd as SOCKET
+            ours
         };
         // macOS: use libc socket API
         #[cfg(target_os = "macos")]
